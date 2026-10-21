@@ -1,0 +1,20 @@
+# base libraries
+
+aiohttp
+boto3
+click
+elasticsearch
+elasticsearch-dsl
+elastic-transport
+environs
+opensearch-dsl
+mysql-replication
+pymysql
+psycopg2-binary
+pyyaml
+python-dotenv
+redis
+requests
+requests-aws4auth
+sqlalchemy
+sqlparse

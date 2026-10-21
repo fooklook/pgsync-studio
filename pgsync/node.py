@@ -1,0 +1,486 @@
+"""PGSync Node class representation."""
+
+from __future__ import annotations
+
+import re
+import threading
+import typing as t
+from collections import deque
+from dataclasses import dataclass
+
+import sqlalchemy as sa
+
+from pgsync.settings import IS_MYSQL_COMPAT
+
+from .constants import (
+    DEFAULT_SCHEMA,
+    JSONB_OPERATORS,
+    NODE_ATTRIBUTES,
+    RELATIONSHIP_ATTRIBUTES,
+    RELATIONSHIP_FOREIGN_KEYS,
+    RELATIONSHIP_TYPES,
+    RELATIONSHIP_VARIANTS,
+)
+from .exc import (
+    ColumnNotFoundError,
+    MultipleThroughTablesError,
+    NodeAttributeError,
+    RelationshipAttributeError,
+    RelationshipError,
+    RelationshipForeignKeyError,
+    RelationshipTypeError,
+    RelationshipVariantError,
+    SchemaError,
+    TableNotInNodeError,
+)
+
+
+@dataclass
+class ForeignKey:
+    """
+    A class representing a foreign key relationship between two tables.
+
+    Attributes:
+        foreign_key (Optional[dict]): A dictionary containing the parent and child table names.
+        parent (str): The name of the parent table.
+        child (str): The name of the child table.
+    """
+
+    foreign_key: t.Optional[dict] = None
+
+    def __post_init__(self):
+        """Initialize the ForeignKey object.
+
+        Sets the parent and child attributes based on the values in the foreign_key dictionary.
+        If the foreign_key dictionary is not provided, it is set to an empty dictionary.
+        Raises a RelationshipForeignKeyError if the foreign_key dictionary does not contain
+        both a parent and child key.
+        """
+        self.foreign_key: str = self.foreign_key or dict()
+        self.parent: str = self.foreign_key.get("parent")
+        self.child: str = self.foreign_key.get("child")
+        if self.foreign_key:
+            if sorted(self.foreign_key.keys()) != sorted(
+                RELATIONSHIP_FOREIGN_KEYS
+            ):
+                raise RelationshipForeignKeyError(
+                    "ForeignKey Relationship must contain a parent and child."
+                )
+        self.parent = self.foreign_key.get("parent")
+        self.child = self.foreign_key.get("child")
+
+    def __str__(self):
+        return f"foreign_key: {self.parent}:{self.child}"
+
+    def __repr__(self):
+        return self.__str__()
+
+
+@dataclass
+class Relationship:
+    relationship: t.Optional[dict] = None
+
+    def __post_init__(self):
+        """Relationship constructor."""
+        self.relationship: dict = self.relationship or dict()
+        self.type: str = self.relationship.get("type")
+        self.variant: str = self.relationship.get("variant")
+        self.tables: t.List[str] = self.relationship.get("through_tables", [])
+        self.fixed_conditions: t.List[dict] = []
+        self.throughs: t.List[Node] = []
+
+        if not set(self.relationship.keys()).issubset(
+            set(RELATIONSHIP_ATTRIBUTES)
+        ):
+            attrs = set(self.relationship.keys()).difference(
+                set(RELATIONSHIP_ATTRIBUTES)
+            )
+            raise RelationshipAttributeError(
+                f"Relationship attribute {attrs} is invalid."
+            )
+        if self.type and self.type not in RELATIONSHIP_TYPES:
+            raise RelationshipTypeError(
+                f'Relationship type "{self.type}" is invalid.'
+            )
+        if self.variant and self.variant not in RELATIONSHIP_VARIANTS:
+            raise RelationshipVariantError(
+                f'Relationship variant "{self.variant}" is invalid.'
+            )
+        if len(self.tables) > 1:
+            raise MultipleThroughTablesError(
+                f"Multiple through tables: {self.tables}"
+            )
+        if self.type:
+            self.type = self.type.lower()
+        if self.variant:
+            self.variant = self.variant.lower()
+        for condition in self.relationship.get("fixed_conditions", []) or []:
+            if not isinstance(condition, dict):
+                raise RelationshipAttributeError(
+                    "Relationship fixed_conditions entries must be objects."
+                )
+            field: str = str(condition.get("field") or "").strip()
+            if not field:
+                raise RelationshipAttributeError(
+                    "Relationship fixed_conditions entries require a field."
+                )
+            operator: str = str(condition.get("operator") or "eq").strip()
+            if not operator:
+                operator = "eq"
+            operator = operator.lower()
+            source: str = str(condition.get("source") or "child").strip()
+            if not source:
+                source = "child"
+            source = source.lower()
+            if source not in {"child", "parent"}:
+                raise RelationshipAttributeError(
+                    'Relationship fixed_conditions source must be "child" or "parent".'
+                )
+            value: t.Any = condition.get("value")
+            normalized_condition: dict[str, t.Any] = {
+                "field": field,
+                "operator": operator,
+                "value": value,
+            }
+            if source != "child" or "source" in condition:
+                normalized_condition["source"] = source
+            self.fixed_conditions.append(normalized_condition)
+        self.foreign_key: ForeignKey = ForeignKey(
+            self.relationship.get("foreign_key")
+        )
+
+    def __str__(self):
+        return f"relationship: {self.variant}.{self.type}:{self.tables}"
+
+    def __repr__(self):
+        return self.__str__()
+
+
+@dataclass
+class Node(object):
+    models: t.Callable
+    table: str
+    schema: str
+    primary_key: t.Optional[list] = None
+    label: t.Optional[str] = None
+    transform: t.Optional[dict] = None
+    columns: t.Optional[list] = None
+    connection_id: t.Optional[str] = None
+    relationship: t.Optional[dict] = None
+    parent: t.Optional[Node] = None
+    base_tables: t.Optional[list] = None
+    is_through: bool = False
+
+    def __post_init__(self):
+        self.model: sa.sql.Alias = self.models(self.table, self.schema)
+        self.columns = self.columns or []
+        self.children: t.List[Node] = []
+        self.table_columns: t.List[str] = self.model.columns.keys()
+        if not self.model.primary_keys:
+            setattr(self.model, "primary_keys", self.primary_key)
+
+        # columns to fetch
+        self.column_names: t.List[str] = [
+            column for column in self.columns if isinstance(column, str)
+        ]
+        if not self.column_names:
+            self.column_names = [str(column) for column in self.table_columns]
+            if not IS_MYSQL_COMPAT:
+                for name in ("ctid", "oid", "xmin"):
+                    self.column_names.remove(name)
+
+        if self.label is None:
+            self.label = self.table
+
+        self.setup()
+
+        self.relationship: Relationship = Relationship(self.relationship)
+        self._subquery = None
+        self._filters: list = []
+        self._relationship_filters: list = []
+        self._mapping: dict = {}
+
+        for through_table in self.relationship.tables:
+            if "." in through_table:
+                through_schema, through_table_name = through_table.split(
+                    ".", 1
+                )
+            else:
+                through_schema = self.schema
+                through_table_name = through_table
+            through_table = through_table_name
+            self.relationship.throughs.append(
+                Node(
+                    models=self.models,
+                    table=through_table,
+                    schema=through_schema,
+                    parent=self,
+                    primary_key=[],
+                    connection_id=self.connection_id,
+                )
+            )
+
+    def __str__(self):
+        return f"Node: {self.schema}.{self.label}"
+
+    def __repr__(self):
+        return self.__str__()
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def setup(self):
+        self.columns = []
+
+        for column_name in self.column_names:
+            tokens = None
+            if any(op in column_name for op in JSONB_OPERATORS):
+                tokens = re.split(
+                    f"({'|'.join(JSONB_OPERATORS)})", column_name
+                )
+
+            if tokens:
+                if IS_MYSQL_COMPAT:
+                    base_col = tokens[0].strip()
+                    if not base_col:
+                        raise ValueError(
+                            f"Invalid JSON column expression: {column_name!r}"
+                        )
+
+                    text_mode = any(
+                        tok in ("->>", "#>>")
+                        for tok in tokens
+                        if tok in JSONB_OPERATORS
+                    )
+
+                    path_parts = []
+
+                    def add_path_piece(tok: str):
+                        tok = tok.strip()
+                        if not tok:
+                            return
+                        if tok.startswith("{") and tok.endswith(
+                            "}"
+                        ):  # brace form: {a,b,0}
+                            inner = tok[1:-1]
+                            for part in [
+                                p.strip().strip('"').strip("'")
+                                for p in inner.split(",")
+                                if p.strip()
+                            ]:
+                                if part.isdigit():
+                                    path_parts.append(f"[{int(part)}]")
+                                else:
+                                    part = part.replace('"', r"\"")
+                                    path_parts.append(f'."{part}"')
+                        else:  # single key or index
+                            if tok.isdigit():
+                                path_parts.append(f"[{int(tok)}]")
+                            else:
+                                tok = (
+                                    tok.strip('"')
+                                    .strip("'")
+                                    .replace('"', r"\"")
+                                )
+                                path_parts.append(f'."{tok}"')
+
+                    for tok in tokens[1:]:
+                        if tok in JSONB_OPERATORS:
+                            continue
+                        add_path_piece(tok)
+
+                    json_path = "$" + "".join(path_parts)
+                    extracted = sa.func.JSON_EXTRACT(
+                        self.model.c[base_col], json_path
+                    )
+                    tokenized = (
+                        sa.func.JSON_UNQUOTE(extracted)
+                        if text_mode
+                        else extracted
+                    )
+
+                    # alias (same logic as your original)
+                    self.columns.append(
+                        "_".join(
+                            x.replace("{", "").replace("}", "")
+                            for x in tokens
+                            if x not in JSONB_OPERATORS
+                        )
+                    )
+                    self.columns.append(tokenized)
+
+                else:
+                    tokenized = self.model.c[tokens[0]]
+                    for token in tokens[1:]:
+                        if token in JSONB_OPERATORS:
+                            tokenized = tokenized.op(token)
+                            continue
+                        if token.isdigit():
+                            token = int(token)
+                        tokenized = tokenized(token)
+                    self.columns.append(
+                        "_".join(
+                            [
+                                x.replace("{", "").replace("}", "")
+                                for x in tokens
+                                if x not in JSONB_OPERATORS
+                            ]
+                        )
+                    )
+                    self.columns.append(tokenized)
+
+            else:
+                if column_name not in self.table_columns:
+                    raise ColumnNotFoundError(
+                        f'Column "{column_name}" not present on table "{self.table}"'
+                    )
+                self.columns.append(column_name)
+                self.columns.append(self.model.c[column_name])
+
+    @property
+    def primary_keys(self) -> t.List[sa.sql.ColumnElement]:
+        return [
+            self.model.c[str(sa.text(primary_key))]
+            for primary_key in self.model.primary_keys
+        ]
+
+    @property
+    def is_root(self) -> bool:
+        return self.parent is None
+
+    @property
+    def name(self) -> str:
+        """Returns a fully qualified node name."""
+        return f"{self.schema}.{self.table}"
+
+    def add_child(self, node: Node) -> None:
+        """All nodes except the root node must have a relationship defined."""
+        node.parent = self
+        if not node.is_root and (
+            not node.relationship.type or not node.relationship.variant
+        ):
+            raise RelationshipError(
+                f'Relationship not present on "{node.name}"'
+            )
+        if node not in self.children:
+            self.children.append(node)
+
+    def display(self, prefix: str = "", leaf: bool = True) -> None:
+        print(
+            prefix,
+            " - " if leaf else "|- ",
+            f"{self.schema}.{self.label}",
+            sep="",
+        )  # noqa T001
+        prefix += "   " if leaf else "|  "
+        for i, child in enumerate(self.children):
+            leaf = i == (len(self.children) - 1)
+            child.display(prefix, leaf)
+
+    def traverse_breadth_first(self) -> t.Generator:
+        queue: deque = deque([self])
+        while queue:
+            node: Node = queue.popleft()
+            yield node
+            for child in node.children:
+                queue.append(child)
+
+    def traverse_post_order(self) -> t.Generator:
+        for child in self.children:
+            yield from child.traverse_post_order()
+        yield self
+
+
+@dataclass
+class Tree(threading.local):
+    models: t.Callable
+    nodes: dict
+    database: str
+
+    def __post_init__(self):
+        self.tables: t.Set[str] = set()
+        self.__nodes: t.Dict[Node] = {}
+        self.__schemas: t.Set[str] = set()
+        self.root: t.Optional[Node] = None
+        self.build(self.nodes)
+
+    def display(self) -> None:
+        self.root.display()
+
+    def traverse_breadth_first(self) -> t.Generator:
+        return self.root.traverse_breadth_first()
+
+    def traverse_post_order(self) -> t.Generator:
+        return self.root.traverse_post_order()
+
+    def build(self, nodes: dict) -> Node:
+        if not isinstance(nodes, dict):
+            raise SchemaError(
+                "Incompatible schema. Please run v2 schema migration"
+            )
+
+        table: str = nodes.get("table")
+        schema: str = (
+            self.database
+            if IS_MYSQL_COMPAT
+            else nodes.get("schema", DEFAULT_SCHEMA)
+        )
+
+        key: t.Tuple[str, str] = (schema, table)
+
+        if table is None:
+            raise TableNotInNodeError(f"Table not specified in node: {nodes}")
+
+        if not set(nodes.keys()).issubset(set(NODE_ATTRIBUTES)):
+            attrs: t.Set[str] = set(nodes.keys()).difference(
+                set(NODE_ATTRIBUTES)
+            )
+            raise NodeAttributeError(f"Unknown node attribute(s): {attrs}")
+
+        node: Node = Node(
+            models=self.models,
+            table=table,
+            schema=schema,
+            primary_key=nodes.get("primary_key", []),
+            label=nodes.get("label", table),
+            transform=nodes.get("transform", {}),
+            columns=nodes.get("columns", []),
+            relationship=nodes.get("relationship", {}),
+            connection_id=nodes.get("connection_id"),
+            base_tables=nodes.get("base_tables", []),
+        )
+        if self.root is None:
+            self.root = node
+
+        self.tables.add(node.table)
+        for through_node in node.relationship.throughs:
+            through_node.is_through = True
+            self.tables.add(through_node.table)
+
+        for child in nodes.get("children", []):
+            node.add_child(self.build(child))
+
+        self.__nodes[key] = node
+        self.__schemas.add(schema)
+        return node
+
+    def get_node(self, table: str, schema: str) -> Node:
+        """Get node by name."""
+        key: t.Tuple[str, str] = (schema, table)
+        if key not in self.__nodes:
+            for node in self.traverse_post_order():
+                if table == node.table and schema == node.schema:
+                    self.__nodes[key] = node
+                    return self.__nodes[key]
+                else:
+                    for through in node.relationship.throughs:
+                        if table == through.table and schema == through.schema:
+                            self.__nodes[key] = through
+                            return self.__nodes[key]
+            else:
+                raise RuntimeError(f"Node for {schema}.{table} not found")
+        return self.__nodes[key]
+
+    @property
+    def schemas(self) -> t.Set[str]:
+        return self.__schemas

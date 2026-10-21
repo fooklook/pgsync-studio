@@ -1,0 +1,92 @@
+name: pgsync-studio-demo
+
+services:
+  studio:
+    build: .
+    init: true
+    ports:
+      - "127.0.0.1:8180:8180"
+    stop_grace_period: 60s
+    environment:
+      PGSYNC_STUDIO_PROFILE: dev
+      NACOS_ENABLED: "false"
+      PG_USER: studio
+      ELASTICSEARCH: "true"
+      PGSYNC_STUDIO_HOST: 0.0.0.0
+      PGSYNC_STUDIO_HOME: /app/runtime/studio
+      PGSYNC_STUDIO_CONFIG_DATABASE_URL: postgresql+psycopg2://studio@postgres:5432/studio
+      PGSYNC_STUDIO_CONFIG_DATABASE_USERNAME: studio
+      PGSYNC_STUDIO_CONFIG_DATABASE_PASSWORD: ${DEMO_POSTGRES_PASSWORD:?Copy .env.example to .env and set DEMO_POSTGRES_PASSWORD}
+      PGSYNC_STUDIO_PG_USERNAME: studio
+      PGSYNC_STUDIO_PG_PASSWORD: ${DEMO_POSTGRES_PASSWORD:?Set DEMO_POSTGRES_PASSWORD}
+      PGSYNC_STUDIO_SYNC_SERVICES_FROM_ENV: "true"
+      PGSYNC_STUDIO_SYNC_CONNECTIONS_FROM_ENV: "false"
+      PGSYNC_STUDIO_AUTO_DISCOVER_CONNECTIONS_EXCLUDE_DATABASES: studio,postgres,template0,template1
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      ELASTICSEARCH_VERIFY_CERTS: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      PGSYNC_STUDIO_READ_REPLICA_ENABLED: "false"
+      PGSYNC_STUDIO_DURABLE_OUTBOX_CLEANUP_ENABLED: "false"
+      PGSYNC_STUDIO_DURABLE_OUTBOX_PARTITION_MAINTENANCE_ENABLED: "false"
+    volumes:
+      - studio_runtime:/app/runtime
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8180/', timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      retries: 12
+
+  postgres:
+    image: postgres:16
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=20", "-c", "max_wal_senders=20"]
+    environment:
+      POSTGRES_USER: studio
+      POSTGRES_PASSWORD: ${DEMO_POSTGRES_PASSWORD:?Set DEMO_POSTGRES_PASSWORD}
+      POSTGRES_DB: studio
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./examples/studio/init.sql:/docker-entrypoint-initdb.d/001-demo.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U studio -d studio"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.29
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null"]
+      interval: 10s
+      timeout: 6s
+      retries: 30
+
+volumes:
+  studio_runtime:
+  postgres_data:
+  redis_data:
+  elasticsearch_data:

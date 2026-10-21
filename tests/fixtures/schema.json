@@ -1,0 +1,26 @@
+[
+    {
+        "database": "fakedb",
+        "index": "fake_index",
+        "nodes": {
+            "table": "book",
+            "columns": [
+                "isbn",
+                "title",
+                "description"
+            ]
+        }
+    },
+    {
+        "database": "$foo",
+        "index": "$bar",
+        "nodes": {
+            "table": "book",
+            "columns": [
+                "isbn",
+                "title",
+                "description"
+            ]
+        }
+    }
+]

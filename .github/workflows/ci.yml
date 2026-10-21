@@ -1,0 +1,74 @@
+name: Public source checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    env:
+      PG_USER: studio
+      ELASTICSEARCH: "true"
+      NACOS_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements/dev.txt
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements/dev.txt
+          python -m pip install build
+          python -m pip install --no-deps -e .
+      - name: Check public source
+        run: python tools/check_public_export.py
+      - name: Run Studio unit tests
+        run: python -m pytest -q tests/test_studio.py tests/test_studio_metrics.py tests/test_read_replica.py tests/test_nacos_read_replica.py
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Verify installed wheel outside checkout
+        run: |
+          python -m venv --system-site-packages /tmp/studio-wheel-check
+          /tmp/studio-wheel-check/bin/python -m pip install --force-reinstall --no-deps dist/*.whl
+          /tmp/studio-wheel-check/bin/python tools/verify_install.py
+
+  local-demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure local Elasticsearch host limits
+        run: sudo sysctl -w vm.max_map_count=262144
+      - name: Validate Compose and start disposable demo
+        env:
+          DEMO_POSTGRES_PASSWORD: local-ci-demo-only
+        run: |
+          docker compose config --quiet
+          docker compose up --build -d --wait --wait-timeout 240
+      - name: Verify baseline and incremental synchronization
+        env:
+          DEMO_POSTGRES_PASSWORD: local-ci-demo-only
+        run: |
+          docker compose exec -T studio python examples/studio/bootstrap_demo.py
+          docker compose exec -T studio python tools/smoke_demo.py
+      - name: Show logs if the demo failed
+        if: failure()
+        env:
+          DEMO_POSTGRES_PASSWORD: local-ci-demo-only
+        run: docker compose logs --tail=150
+      - name: Stop disposable demo
+        if: always()
+        env:
+          DEMO_POSTGRES_PASSWORD: local-ci-demo-only
+        run: docker compose down --volumes

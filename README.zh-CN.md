@@ -1,0 +1,79 @@
+# PGSync Studio
+
+[English](README.md)
+
+PGSync Studio 是基于 [PGSync](https://github.com/toluaina/pgsync) 扩展的
+PostgreSQL → Elasticsearch 同步平台，提供 Web 配置台、跨库文档组装、
+存量与增量同步、故障恢复和运行诊断。
+
+这是独立维护的扩展项目，采用 MIT 许可证，保留上游版权声明，
+不代表上游 PGSync 的官方发行版。详见 [UPSTREAM.md](UPSTREAM.md)。
+
+## 保留的能力
+
+- 配置数据源、同步任务、关联关系、软删除和固定过滤条件。
+- 支持单库、多表及跨数据库宽文档同步。
+- 支持触发器通知、持久化 outbox、Redis 队列、任务租约和补偿扫描。
+- 支持从库读取：批次级 required LSN、回放检查、短暂等待及主库回退。
+- 支持按天创建 outbox 分区，并依据保留期和消费者安全水位维护历史分区。
+- 提供任务日志、调试信息、ES 查询、别名管理和 Prometheus 指标。
+
+Studio 数据源目前支持 PostgreSQL；保留的上游 CLI 与 Studio 的能力边界不同。
+
+## 本地体验
+
+准备 Docker 和 Compose v2。在本目录执行：
+
+```powershell
+Copy-Item .env.example .env
+# 先修改 .env 中的 DEMO_POSTGRES_PASSWORD。
+docker compose up --build -d --wait
+docker compose exec studio python examples/studio/bootstrap_demo.py
+```
+
+Linux/macOS 第一条命令使用 `cp .env.example .env`。
+
+浏览器访问 <http://127.0.0.1:8180>。
+演示使用独立的 `catalog`、`analytics` 数据库和虚构图书数据，创建
+`book_catalog_v1` 任务，组装图书、作者和统计信息。
+在 ES 查询页选择该索引并执行 `{"query":{"match_all":{}},"size":10}`。
+
+修改演示数据验证增量同步：
+
+```sh
+docker compose exec postgres psql -U studio -d analytics -c "UPDATE book_metrics SET views = views + 1, updated_at = now() WHERE book_id = 1;"
+```
+
+命名卷保存任务配置、数据库、Redis 状态和 ES 索引；`docker compose down`
+停止容器但保留这些卷。初始化 SQL 仅在 PostgreSQL 数据卷首次创建时执行。
+
+## 部署边界
+
+Nacos 是可选配置源，基础使用不依赖它。数据库账号由服务端环境变量统一注入，
+界面只配置主机、端口和数据库；当前版本使用共享源库凭据，
+尚不支持在界面为每个数据库单独维护账号。
+
+默认仅通过本机访问控制台。此版本没有内置登录或权限隔离，部署到共享环境时
+应放在带认证的反向代理后或受控网络中。演示环境也不对外发布数据库端口。
+
+从库路由和删除维护默认关闭；开启前需要确认主从拓扑、任务配置、
+保留期及安全水位。同步采用最终一致性，大批更新和多级关联会影响追平速度。
+详细说明见 [部署文档](docs/deployment.md) 和 [安全说明](SECURITY.md)。
+
+## 开发与测试
+
+Python 3.10+，建议独立虚拟环境，避免与上游 PyPI `pgsync` 同时安装。
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements/dev.txt
+python -m pip install --no-deps -e .
+$env:PG_USER = 'studio'
+$env:ELASTICSEARCH = 'true'
+python -m pytest -q tests/test_studio.py tests/test_studio_metrics.py tests/test_read_replica.py tests/test_nacos_read_replica.py
+python tools/check_public_export.py
+```
+
+上述单元测试无需真实数据库；其余上游集成测试需要独立测试服务，
+参见 [贡献指南](CONTRIBUTING.md)。

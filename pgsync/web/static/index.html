@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PGSync Studio 中文版</title>
+    <link rel="icon" href="/static/favicon.ico" sizes="any">
+    <link rel="shortcut icon" href="/static/favicon.ico">
+    <link rel="stylesheet" href="/static/styles.css?v=20260527-job-copy-lock-1">
+</head>
+<body>
+    <main class="app-shell">
+        <aside class="sidebar">
+            <div class="brand">
+                <p class="eyebrow">PGSync Studio</p>
+                <h1>同步配置台</h1>
+                <p class="brand-copy">
+                    用菜单方式分别管理基础设施、数据库连接、同步任务、ES 查询和状态信息。
+                </p>
+            </div>
+
+            <nav class="menu">
+                <button class="menu-item active" data-view="services" type="button">基础设施配置</button>
+                <button class="menu-item" data-view="connections" type="button">数据库连接</button>
+                <button class="menu-item" data-view="tasks" type="button">同步任务配置</button>
+                <button class="menu-item" data-view="job-list" type="button">任务列表</button>
+                <button class="menu-item" data-view="es-query" type="button">ES 自定义查询</button>
+                <button class="menu-item" data-view="status" type="button">状态信息</button>
+            </nav>
+        </aside>
+
+        <section class="workspace">
+            <header class="workspace-head">
+                <div>
+                    <p class="eyebrow">工作区</p>
+                    <h2 id="view-title">基础设施配置</h2>
+                </div>
+                <p id="view-tip" class="view-tip">配置 Elasticsearch 和 Redis，供同步任务启动、查询和断点能力使用。</p>
+            </header>
+
+            <section class="view active" data-view="services">
+                <section class="panel">
+                    <div class="panel-head">
+                        <h3>基础设施配置</h3>
+                        <button id="save-services" class="primary" type="button">保存服务配置</button>
+                    </div>
+                    <div class="grid two">
+                        <div class="card">
+                            <h4>Elasticsearch</h4>
+                            <label>地址 URL<input id="search-url" placeholder="http://127.0.0.1:9200"></label>
+                            <label>用户名<input id="search-username" placeholder="elastic"></label>
+                            <label>密码<input id="search-password" type="password"></label>
+                            <label class="checkbox">
+                                <input id="search-verify-certs" type="checkbox">
+                                <span>校验证书</span>
+                            </label>
+                        </div>
+                        <div class="card">
+                            <h4>Redis</h4>
+                            <label>主机<input id="redis-host" placeholder="127.0.0.1"></label>
+                            <label>端口<input id="redis-port" type="number" value="6379"></label>
+                            <label>密码<input id="redis-password" type="password"></label>
+                            <label>DB 库号<input id="redis-db" type="number" value="0"></label>
+                        </div>
+                    </div>
+                </section>
+            </section>
+
+            <section class="view" data-view="connections">
+                <section class="panel">
+                    <div class="panel-head">
+                        <h3>数据库连接</h3>
+                        <div class="actions">
+                            <button id="test-connection" class="ghost" type="button">仅测试连接</button>
+                            <button id="save-connection" class="primary" type="button">测试并保存</button>
+                        </div>
+                    </div>
+                    <div class="grid two">
+                        <div class="card">
+                            <label>连接名称<input id="connection-name" placeholder="catalog"></label>
+                            <label>主机<input id="connection-host" placeholder="localhost"></label>
+                            <label>端口<input id="connection-port" type="number" value="5432"></label>
+                            <label>数据库<input id="connection-database" placeholder="catalog"></label>
+                            <label>用户名<input id="connection-username" value="******" readonly></label>
+                            <label>密码<input id="connection-password" type="password" value="******" readonly></label>
+                            <p class="hint">账号密码从服务端环境变量或可选的 Nacos 配置注入，不在连接配置中保存。参见部署文档中的共享 PostgreSQL 凭据配置。</p>
+                        </div>
+                        <div class="card">
+                            <div class="panel-head compact">
+                                <h4>已保存连接</h4>
+                            </div>
+                            <div id="connection-list" class="stack"></div>
+                        </div>
+                    </div>
+                </section>
+            </section>
+
+            <section class="view" data-view="tasks">
+                <section class="panel">
+                    <div class="panel-head">
+                        <h3>同步任务与关联关系</h3>
+                        <div class="actions">
+                            <button id="validate-job" class="ghost" type="button">校验任务</button>
+                            <button id="save-job" class="primary" type="button">保存并启动</button>
+                        </div>
+                    </div>
+                    <div id="job-lock-message" class="inline-alert info" hidden></div>
+
+                    <div class="grid three">
+                        <label>任务名称<input id="job-name" placeholder="catalog-sync"></label>
+                        <label>索引名称<input id="job-index-name" placeholder="book_catalog_v1"></label>
+                        <label>轮询间隔（秒）<input id="job-poll-interval" type="number" value="60"></label>
+                    </div>
+
+                    <div class="job-mode-config">
+                        <label class="checkbox">
+                            <input id="job-enable-assembly-fallback" type="checkbox">
+                            <span>启用周期性 Recovery Scan 兜底</span>
+                        </label>
+                        <label class="checkbox">
+                            <input id="job-enable-durable-change-events" type="checkbox">
+                            <span>启用 durable outbox 可靠事件</span>
+                        </label>
+                        <div class="grid three">
+                            <label>Outbox 单次拉取
+                                <input id="job-durable-batch-size" type="number" min="1" placeholder="500">
+                            </label>
+                            <label>Outbox 重放窗口
+                                <input id="job-durable-replay-window" type="number" min="0" placeholder="5000">
+                            </label>
+                            <label>Outbox 已处理窗口
+                                <input id="job-durable-processed-window" type="number" min="1" placeholder="5000">
+                            </label>
+                        </div>
+                        <p class="hint">
+                            存量同步始终先由 Assembly full_sync 生成完整文档。勾选后，系统会在事件驱动恢复之外，再按轮询间隔执行周期性恢复扫描。
+                        </p>
+                        <div id="job-mode-hint" class="inline-alert info">
+                            当前任务统一采用 Native 捕获变更 + Assembly 重建文档 的方式处理增量。
+                        </div>
+                    </div>
+
+                    <div class="subsection">
+                        <div class="sub-head">
+                            <div>
+                                <h4>数据表</h4>
+                                <p class="hint">游标字段会根据当前表字段自动带出下拉选项。</p>
+                            </div>
+                            <button id="add-table" class="ghost" type="button">新增表</button>
+                        </div>
+                        <div id="table-list" class="stack"></div>
+                    </div>
+
+                    <div class="subsection">
+                        <div class="sub-head">
+                            <div>
+                                <h4>关联关系</h4>
+                                <p class="hint">父表字段、子表字段会根据所选表自动带出。配置完成后会自动生成 SQL 预览。</p>
+                            </div>
+                            <button id="add-relation" class="ghost" type="button">新增关系</button>
+                        </div>
+                        <div id="relation-list" class="stack"></div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-head">
+                        <h3>处理逻辑 SQL 预览</h3>
+                    </div>
+                    <div id="sql-preview" class="preview-list">
+                        <div class="empty-state">配置完任务和关联关系后，这里会自动生成易读的 SQL 处理逻辑。</div>
+                    </div>
+                </section>
+            </section>
+
+            <section class="view" data-view="job-list">
+                <section class="panel">
+                    <div class="panel-head">
+                        <h3>任务列表</h3>
+                        <button id="refresh-jobs" class="ghost" type="button">刷新</button>
+                    </div>
+                    <div id="job-list" class="stack"></div>
+                </section>
+            </section>
+
+            <section class="view" data-view="es-query">
+                <section class="panel">
+                    <div class="panel-head">
+                        <h3>ES 索引别名</h3>
+                        <button id="add-index-alias" class="primary" type="button">添加别名</button>
+                    </div>
+                    <div class="card query-card">
+                        <div class="panel-head compact">
+                            <h4>Alias JSON</h4>
+                            <span class="hint-inline">填写目标索引和业务查询使用的别名</span>
+                        </div>
+                        <textarea id="index-alias-body" class="query-editor small" spellcheck="false">{
+  "index": "book_catalog_v1",
+  "alias": "book_catalog"
+}</textarea>
+                    </div>
+                    <div id="index-alias-result" class="preview-list">
+                        <div class="empty-state">输入 index 和 alias 后，点击添加别名。</div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-head">
+                        <h3>ES 自定义查询</h3>
+                    </div>
+                    <div class="grid two">
+                        <label>选择任务索引
+                            <select id="index-search-job"></select>
+                        </label>
+                        <label>当前索引名称
+                            <input id="index-search-name" readonly placeholder="请先选择任务索引">
+                        </label>
+                    </div>
+                    <div class="card favorite-card">
+                        <div class="panel-head compact">
+                            <h4>收藏 Query DSL</h4>
+                            <button id="save-index-search-favorite" class="ghost" type="button">收藏当前 JSON</button>
+                        </div>
+                        <div id="index-search-favorites" class="favorite-list">
+                            <div class="empty-state">还没有收藏的 Query DSL JSON。</div>
+                        </div>
+                    </div>
+                    <div class="actions action-bar">
+                        <button id="run-index-search" class="primary" type="button">执行查询</button>
+                        <button id="format-index-search" class="ghost" type="button">一键美化</button>
+                        <button id="reset-index-search" class="ghost" type="button">重置条件</button>
+                    </div>
+                    <div class="card query-card">
+                        <div class="panel-head compact">
+                            <h4>Query DSL JSON</h4>
+                            <span class="hint-inline">支持自定义 query、sort、size、_source 等 Elasticsearch 查询参数</span>
+                        </div>
+                        <textarea id="index-search-body" class="query-editor" spellcheck="false"></textarea>
+                    </div>
+                    <div id="index-search-results" class="preview-list">
+                        <div class="empty-state">请选择任务索引并输入 Elasticsearch Query DSL，随后在这里查看查询结果。</div>
+                    </div>
+                </section>
+            </section>
+
+            <section class="view" data-view="status">
+                <section class="panel">
+                    <div class="panel-head">
+                        <h3>状态信息</h3>
+                    </div>
+                    <pre id="status" class="status"></pre>
+                </section>
+            </section>
+        </section>
+    </main>
+
+    <template id="table-template">
+        <div class="row-block table-block">
+            <div class="row-head">
+                <strong>数据表</strong>
+                <button class="danger remove-row" type="button">删除</button>
+            </div>
+            <div class="grid four">
+                <label>别名<input data-field="alias" placeholder="books"></label>
+                <label>连接<select data-field="connection_id"></select></label>
+                <label>Schema<select data-field="schema"></select></label>
+                <label>表名<select data-field="table"></select></label>
+            </div>
+            <div class="grid three">
+                <label>主键<input data-field="primary_key" readonly></label>
+                <label>游标字段<select data-field="cursor_column"></select></label>
+            </div>
+            <div class="grid one soft-delete-row">
+                <label class="soft-delete-field">
+                    <span class="field-head">
+                        <span>Soft Delete</span>
+                        <span class="hint-inline soft-delete-current muted" data-role="soft-delete-current">未设置</span>
+                    </span>
+                    <select class="soft-delete-select" data-field="soft_delete_column"></select>
+                </label>
+            </div>
+        </div>
+    </template>
+
+    <template id="relation-template">
+        <div class="row-block relation-block">
+            <div class="row-head">
+                <strong>关联关系</strong>
+                <button class="danger remove-row" type="button">删除</button>
+            </div>
+            <div class="grid three">
+                <label>父表<select data-field="parent_table_id"></select></label>
+                <label>子表<select data-field="child_table_id"></select></label>
+                <label>关系类型
+                    <select data-field="type">
+                        <option value="one_to_one">一对一</option>
+                        <option value="one_to_many">一对多</option>
+                        <option value="many_to_one">多对一</option>
+                    </select>
+                </label>
+            </div>
+            <div class="relation-section">
+                <div class="relation-section-head">
+                    <strong>字段映射</strong>
+                    <span class="hint-inline">用于配置父表字段和子表字段的对应关系</span>
+                </div>
+                <div class="mapping-list"></div>
+                <button class="ghost add-mapping" type="button">新增字段映射</button>
+            </div>
+            <div class="relation-section relation-special">
+                <div class="relation-section-head">
+                    <strong>特殊配置（固定条件）</strong>
+                    <span class="hint-inline">例如 `relate_type = 1`、`type = 0`</span>
+                </div>
+                <div class="condition-list"></div>
+                <button class="ghost add-condition" type="button">新增固定条件</button>
+            </div>
+        </div>
+    </template>
+
+    <template id="mapping-template">
+        <div class="mapping-row">
+            <div class="grid two">
+                <label>父表字段<select data-field="parent_field"></select></label>
+                <label>子表字段<select data-field="child_field"></select></label>
+            </div>
+            <button class="danger remove-mapping" type="button">删除映射</button>
+        </div>
+    </template>
+
+    <template id="condition-template">
+        <div class="condition-row">
+            <div class="grid two">
+                <label>字段来源
+                    <select data-field="source">
+                        <option value="child">子表字段</option>
+                        <option value="parent">父表字段</option>
+                    </select>
+                </label>
+                <label data-role="condition-field-label">子表字段<select data-field="field"></select></label>
+            </div>
+            <div class="grid two">
+                <label>条件
+                    <select data-field="operator">
+                        <option value="eq">=</option>
+                    </select>
+                </label>
+                <label>值<input data-field="value" placeholder="例如 1"></label>
+            </div>
+            <button class="danger remove-condition" type="button">删除条件</button>
+        </div>
+    </template>
+
+    <dialog id="copy-job-dialog" class="modal">
+        <form id="copy-job-form" method="dialog" class="modal-card">
+            <div class="modal-head">
+                <div>
+                    <p class="eyebrow">复制任务</p>
+                    <h3>创建新的同步任务副本</h3>
+                </div>
+                <button id="copy-job-cancel" class="ghost" type="button">取消</button>
+            </div>
+            <p class="hint">已生成索引的任务不可直接修改。请复制一份新任务，并使用新的任务名称和索引名称。</p>
+            <div id="copy-job-error" class="inline-alert error" hidden></div>
+            <div class="grid two">
+                <label>任务名称<input id="copy-job-name" autocomplete="off"></label>
+                <label>索引名称<input id="copy-job-index-name" autocomplete="off"></label>
+            </div>
+            <div class="modal-actions">
+                <button id="copy-job-confirm" class="primary" type="submit">确认创建</button>
+            </div>
+        </form>
+    </dialog>
+
+    <script src="/static/app.js?v=20260622-durable-outbox-1"></script>
+</body>
+</html>

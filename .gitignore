@@ -1,0 +1,42 @@
+# Secrets and machine-specific configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+service-account*.json
+
+# Mutable configuration, queues, logs and backups
+runtime/
+backups/
+*.log
+*.checkpoint
+*.sqlite*
+*.db
+
+# Python tooling and distribution artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.venv/
+venv/
+.tox/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

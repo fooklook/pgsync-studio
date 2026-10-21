@@ -1,0 +1,167 @@
+#!/usr/bin/env python
+
+"""Create a custom NGram analyzer for the default mapping."""
+
+import logging
+
+import click
+from elasticsearch import Elasticsearch, helpers
+
+from pgsync.settings import (
+    ELASTICSEARCH_TIMEOUT,
+    ELASTICSEARCH_VERIFY_CERTS,
+    S3_SCHEMA_URL,
+    SCHEMA,
+    SCHEMA_URL,
+)
+from pgsync.urls import get_search_url
+from pgsync.utils import (
+    config_loader,
+    MutuallyExclusiveOption,
+    timeit,
+    validate_config,
+)
+
+logger = logging.getLogger(__name__)
+
+NGRAM_ANALYZER = {
+    "analysis": {
+        "analyzer": {
+            "ngram_analyzer": {
+                "filter": [
+                    "lowercase",
+                ],
+                "type": "custom",
+                "tokenizer": "ngram_tokenizer",
+            },
+        },
+        "tokenizer": {
+            "ngram_tokenizer": {
+                "token_chars": [
+                    "letter",
+                    "digit",
+                    "punctuation",
+                    "symbol",
+                ],
+                "min_gram": "3",
+                "type": "ngram",
+                "max_gram": "10",
+            },
+        },
+    },
+    "max_ngram_diff": 10,
+}
+
+
+def apply_analyzer_to_mapping(mapping: dict, analyzer: dict) -> dict:
+    _mapping: dict = {}
+    for key, value in mapping.items():
+        if isinstance(value, dict):
+            if "fields" in value:
+                value["fields"]["ngram"] = analyzer
+            value = apply_analyzer_to_mapping(value, analyzer)
+        _mapping[key] = value
+    return _mapping
+
+
+def get_configuration(es, index: str) -> dict:
+    configuration: dict = es.indices.get_settings(index=index)[index]
+    # skip these attributes
+    for key in [
+        "uuid",
+        "version",
+        "provided_name",
+        "creation_date",
+    ]:
+        configuration["settings"]["index"].pop(key)
+    mapping: dict = es.indices.get_mapping(index=index)
+    analyzer_mapping: dict = apply_analyzer_to_mapping(
+        mapping,
+        {
+            "analyzer": "ngram_analyzer",
+            "search_analyzer": "ngram_analyzer",
+            "fielddata": True,
+            "type": "text",
+        },
+    )
+    configuration.update(**analyzer_mapping[index])
+    configuration["settings"]["index"].update(**NGRAM_ANALYZER)
+    return configuration
+
+
+@timeit
+def create_es_mapping(index: str) -> None:
+    logger.debug(f"Create Elasticsearch mapping for index {index}")
+    url: str = get_search_url()
+    es: Elasticsearch = Elasticsearch(
+        hosts=[url],
+        request_timeout=ELASTICSEARCH_TIMEOUT,
+        verify_certs=ELASTICSEARCH_VERIFY_CERTS,
+    )
+
+    tmp_index: str = "tmp_index"
+    es.indices.delete(index=tmp_index, ignore=[400, 404])
+    es.indices.refresh()
+    configuration: dict = get_configuration(es, index)
+    es.indices.create(index=tmp_index, body=configuration)
+    helpers.reindex(es, index, tmp_index)
+    es.indices.refresh()
+    es.indices.delete(index=index)
+    es.indices.refresh()
+    configuration: dict = get_configuration(es, tmp_index)
+    es.indices.create(index=index, body=configuration)
+    helpers.reindex(es, tmp_index, index)
+    es.indices.delete(index=tmp_index)
+    es.indices.refresh()
+
+
+@click.command()
+@click.option(
+    "--config",
+    "-c",
+    help="Schema config",
+    type=click.Path(exists=True),
+    default=SCHEMA,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["s3_schema_url", "schema_url"],
+)
+@click.option(
+    "--schema_url",
+    help="URL for schema config",
+    type=click.STRING,
+    default=SCHEMA_URL,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["config", "s3_schema_url"],
+)
+@click.option(
+    "--s3_schema_url",
+    help="S3 URL for schema config",
+    type=click.STRING,
+    default=S3_SCHEMA_URL,
+    show_default=True,
+    cls=MutuallyExclusiveOption,
+    mutually_exclusive=["config", "schema_url"],
+)
+def main(config: str, schema_url: str, s3_schema_url: str) -> None:
+    """Create custom NGram analyzer for the default mapping."""
+
+    validate_config(
+        config=config, schema_url=schema_url, s3_schema_url=s3_schema_url
+    )
+    for index in set(
+        [
+            doc["index"]
+            for doc in config_loader(
+                config=config,
+                schema_url=schema_url,
+                s3_schema_url=s3_schema_url,
+            )
+        ]
+    ):
+        create_es_mapping(index)
+
+
+if __name__ == "__main__":
+    main()
