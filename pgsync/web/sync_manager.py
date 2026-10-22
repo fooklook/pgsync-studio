@@ -3429,6 +3429,9 @@ class CrossDatabaseHybridRunnerV2:
         return (connection_id, schema.lower(), table.lower())
 
     def _connection_kwargs(self, connection: dict) -> dict[str, t.Any]:
+        connection = apply_shared_postgres_credentials(
+            resolve_env_placeholders(connection)
+        )
         kwargs: dict[str, t.Any] = {
             "host": connection["host"],
             "port": connection["port"],
@@ -4109,7 +4112,6 @@ class CrossDatabaseHybridRunnerV2:
         listener_stop_event: threading.Event,
     ) -> None:
         set_metrics_context(self.job)
-        channel: str = connection["database"]
         while not self.stop_requested and not listener_stop_event.is_set():
             raw_connection = None
             cursor = None
@@ -4119,12 +4121,16 @@ class CrossDatabaseHybridRunnerV2:
                     state="connecting",
                     reason="connecting",
                 )
+                resolved_connection = apply_shared_postgres_credentials(
+                    resolve_env_placeholders(connection)
+                )
+                channel: str = resolved_connection["database"]
                 connect_kwargs: dict[str, t.Any] = {
-                    "host": connection["host"],
-                    "port": connection["port"],
-                    "dbname": connection["database"],
-                    "user": connection["username"],
-                    "password": connection.get("password") or "",
+                    "host": resolved_connection["host"],
+                    "port": resolved_connection["port"],
+                    "dbname": resolved_connection["database"],
+                    "user": resolved_connection["username"],
+                    "password": resolved_connection.get("password") or "",
                     "application_name": (
                         f"pgsync_listener:{self.job_id}:{connection_id}"
                     ),

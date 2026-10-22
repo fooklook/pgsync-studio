@@ -7,6 +7,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import sqlalchemy as sa
@@ -4571,6 +4572,137 @@ def test_cross_database_runner_builds_native_listener_specs_for_child_tables(
         "user_defined_fkey_tables"
     ] == {"author": {"book_id"}}
     assert specs["conn_2"]["watched_locations"] == {("public", "author")}
+
+
+@pytest.mark.parametrize(
+    "credential_env",
+    [
+        {
+            "PGSYNC_STUDIO_PG_USERNAME": "runtime_user",
+            "PGSYNC_STUDIO_PG_PASSWORD": "runtime:$ecret",
+        },
+        {
+            "PGSYNC_STUDIO_CONFIG_DATABASE_USERNAME": "runtime_user",
+            "PGSYNC_STUDIO_CONFIG_DATABASE_PASSWORD": "runtime:$ecret",
+        },
+        {
+            "PGSYNC_STUDIO_CONFIG_DATABASE_URL": (
+                "postgresql+psycopg2://runtime_user:runtime%3A%24ecret"
+                "@localhost:5432/studio"
+            ),
+        },
+    ],
+)
+def test_cross_database_capture_uses_runtime_credentials(
+    tmp_path: Path,
+    monkeypatch,
+    credential_env,
+):
+    for username_env, password_env in db_module.SHARED_PG_CREDENTIAL_ENV_PAIRS:
+        monkeypatch.delenv(username_env, raising=False)
+        monkeypatch.delenv(password_env, raising=False)
+    for url_env in db_module.CONFIG_DATABASE_URL_ENV_NAMES:
+        monkeypatch.delenv(url_env, raising=False)
+    for key, value in credential_env.items():
+        monkeypatch.setenv(key, value)
+
+    store = ConfigStore(str(tmp_path / "config.json"))
+    connection = store.upsert_connection(
+        {
+            "id": "conn_1",
+            "host": "localhost",
+            "port": 5432,
+            "database": "catalog",
+            "username": MASKED_SHARED_CREDENTIAL,
+            "password": "",
+        }
+    )
+    manager = SyncManager(store=store, db=None, repo_root=str(tmp_path))
+    runner = CrossDatabaseHybridRunner.__new__(CrossDatabaseHybridRunner)
+    runner.manager = manager
+    runner.job = {"id": "job_1", "index_name": "book_catalog_v1"}
+    runner.setup_phase = "native_setup"
+    runner.native_listener_specs = {
+        "conn_1": {"connection": connection, "schemas": {}}
+    }
+    helper_factory = MagicMock()
+    monkeypatch.setattr(sync_manager_module, "PGSyncBase", helper_factory)
+
+    runner._prepare_native_incremental_start()
+
+    helper_factory.assert_called_once_with(
+        "catalog",
+        host="localhost",
+        port=5432,
+        user="runtime_user",
+        password="runtime:$ecret",
+    )
+    assert connection["username"] == MASKED_SHARED_CREDENTIAL
+    assert connection["password"] == ""
+    assert store.get_connection("conn_1") == connection
+
+
+def test_native_listener_refreshes_runtime_credentials_on_reconnect(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("PGSYNC_STUDIO_PG_USERNAME", "initial_user")
+    monkeypatch.setenv("PGSYNC_STUDIO_PG_PASSWORD", "initial:$ecret")
+    store = ConfigStore(str(tmp_path / "config.json"))
+    connection = store.upsert_connection(
+        {
+            "id": "conn_1",
+            "host": "localhost",
+            "port": 5432,
+            "database": "catalog",
+            "username": MASKED_SHARED_CREDENTIAL,
+            "password": "",
+        }
+    )
+    manager = SyncManager(store=store, db=None, repo_root=str(tmp_path))
+    runner = CrossDatabaseHybridRunner.__new__(CrossDatabaseHybridRunner)
+    runner.manager = manager
+    runner.job = {"id": "job_1"}
+    runner.stop_requested = False
+    runner.native_listener_states = {}
+    runner.store = store
+    monkeypatch.setattr(runner, "_request_recovery_scan", lambda reason: None)
+    listener_stop_event = threading.Event()
+    monkeypatch.setattr(listener_stop_event, "wait", lambda timeout: False)
+    raw_connection = MagicMock()
+    raw_connection.cursor.return_value.execute.side_effect = (
+        lambda query: listener_stop_event.set()
+    )
+    connect_calls = []
+
+    def connect(**kwargs):
+        connect_calls.append(kwargs)
+        if len(connect_calls) == 1:
+            monkeypatch.setenv("PGSYNC_STUDIO_PG_USERNAME", "rotated_user")
+            monkeypatch.setenv("PGSYNC_STUDIO_PG_PASSWORD", "rotated:$ecret")
+            raise sync_manager_module.psycopg2.OperationalError(
+                "simulated disconnect"
+            )
+        return raw_connection
+
+    monkeypatch.setattr(sync_manager_module.psycopg2, "connect", connect)
+
+    runner._native_listener_loop(
+        "conn_1", connection, {("public", "books")}, listener_stop_event
+    )
+
+    assert [(call["user"], call["password"]) for call in connect_calls] == [
+        ("initial_user", "initial:$ecret"),
+        ("rotated_user", "rotated:$ecret"),
+    ]
+    assert all(call["dbname"] == "catalog" for call in connect_calls)
+    raw_connection.cursor.return_value.execute.assert_called_once_with(
+        'LISTEN "catalog"'
+    )
+    raw_connection.close.assert_called_once()
+    assert connection["username"] == MASKED_SHARED_CREDENTIAL
+    assert connection["password"] == ""
+    assert store.get_connection("conn_1") == connection
 
 
 def test_cross_database_runner_restarts_dead_native_listeners(
