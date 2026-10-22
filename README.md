@@ -2,6 +2,9 @@
 
 [中文说明](README.zh-CN.md)
 
+[![Public source checks](https://github.com/fooklook/pgsync-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/fooklook/pgsync-studio/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A web console and document assembly engine for synchronizing PostgreSQL data
 into Elasticsearch. Configure connections, join related tables across databases,
 build a full baseline, and keep the resulting documents up to date.
@@ -25,6 +28,14 @@ The current Web UI is in Simplified Chinese; the public setup documentation is b
 
 Studio connections support PostgreSQL. The upstream command-line code is retained;
 its wider backend support is not a compatibility claim for the Studio interface.
+
+## A quick look
+
+![Studio task list with the stopped synthetic book-catalog job](docs/images/demo-jobs.jpg)
+
+The UI currently uses Simplified Chinese. This screenshot shows a stopped,
+synthetic configuration preview. Follow the [book-catalog walkthrough](docs/demo.md)
+to run the real baseline and cross-database incremental checks with Compose.
 
 ## Quick start
 
@@ -117,3 +128,14 @@ consumer watermarks are also checked. Maintenance and replica routing are opt-in
 
 The repository contains no environment backups, production task definitions,
 internal deployment pipelines, or private repository history.
+
+## Feedback and upstream
+
+Use [Studio issues](https://github.com/fooklook/pgsync-studio/issues) for this
+extension's setup, UI, document assembly, and maintenance behavior. Include a
+minimal schema with synthetic data and sanitized logs; see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+PGSync Studio credits [PGSync](https://github.com/toluaina/pgsync) for its engine
+foundation. The Studio-specific runners and operating model are independently
+maintained. Changes proposed upstream are reviewed by the upstream maintainers;
+see [UPSTREAM.md](UPSTREAM.md) for the relationship and compatibility boundaries.
