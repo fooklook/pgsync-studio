@@ -2,6 +2,9 @@
 
 [English](README.md)
 
+[![自动检查](https://github.com/fooklook/pgsync-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/fooklook/pgsync-studio/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 PGSync Studio 是基于 [PGSync](https://github.com/toluaina/pgsync) 扩展的
 PostgreSQL → Elasticsearch 同步平台，提供 Web 配置台、跨库文档组装、
 存量与增量同步、故障恢复和运行诊断。
@@ -19,6 +22,13 @@ PostgreSQL → Elasticsearch 同步平台，提供 Web 配置台、跨库文档�
 - 提供任务日志、调试信息、ES 查询、别名管理和 Prometheus 指标。
 
 Studio 数据源目前支持 PostgreSQL；保留的上游 CLI 与 Studio 的能力边界不同。
+
+## 界面预览
+
+![使用虚构图书配置的任务列表，任务处于停止状态](docs/images/demo-jobs.jpg)
+
+截图展示独立的虚构配置预览，任务处于停止状态。
+实际存量和跨库增量同步的体验步骤见[图书示例演示](docs/demo.md)（英文），也可按下方命令启动 Compose。
 
 ## 本地体验
 
@@ -77,3 +87,13 @@ python tools/check_public_export.py
 
 上述单元测试无需真实数据库；其余上游集成测试需要独立测试服务，
 参见 [贡献指南](CONTRIBUTING.md)。
+
+## 反馈与上游协作
+
+本扩展的安装、界面、文档组装和维护问题，请提交到
+[Studio Issues](https://github.com/fooklook/pgsync-studio/issues)。
+建议附上虚构的最小表结构、数据和脱敏日志，便于复现。
+
+Studio 的引擎基础来自 [PGSync](https://github.com/toluaina/pgsync)，
+Studio 扩展的运行器和运维机制由本项目独立维护。
+上游贡献由上游维护者审核；关系和兼容边界见 [UPSTREAM.md](UPSTREAM.md)。
