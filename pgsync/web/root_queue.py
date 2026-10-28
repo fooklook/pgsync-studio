@@ -36,8 +36,13 @@ return claimed
 """
 
 RECOVER_SCRIPT = """
+if ARGV[1] and redis.call('HGET', KEYS[4], 'inflight_batch_id') ~= ARGV[1] then
+  return {}
+end
 local moved = {}
 local items = redis.call('LRANGE', KEYS[3], 0, -1)
+redis.call('HDEL', KEYS[4], 'inflight_batch_id', 'inflight_claimed_at',
+  'inflight_hot_count', 'inflight_backlog_count', 'inflight_size')
 if #items == 0 then
   return moved
 end
@@ -50,6 +55,16 @@ for i = 1, #items do
   end
 end
 return moved
+"""
+
+ACK_SCRIPT = """
+if redis.call('HGET', KEYS[2], 'inflight_batch_id') ~= ARGV[1] then
+  return 0
+end
+redis.call('DEL', KEYS[1])
+redis.call('HDEL', KEYS[2], 'inflight_batch_id', 'inflight_claimed_at',
+  'inflight_hot_count', 'inflight_backlog_count', 'inflight_size')
+return 1
 """
 
 
@@ -132,6 +147,7 @@ class RedisRootQueue:
         self._enqueue_script = self.client.register_script(ENQUEUE_SCRIPT)
         self._claim_script = self.client.register_script(CLAIM_SCRIPT)
         self._recover_script = self.client.register_script(RECOVER_SCRIPT)
+        self._ack_script = self.client.register_script(ACK_SCRIPT)
 
     @classmethod
     def from_services(
@@ -158,6 +174,7 @@ class RedisRootQueue:
         )
         client = Redis.from_url(
             redis_url,
+            socket_connect_timeout=5,
             socket_timeout=5,
             retry_on_timeout=True,
             decode_responses=True,
@@ -166,7 +183,9 @@ class RedisRootQueue:
         return cls(client, job_id=job_id)
 
     def _serialize(self, root_key: tuple[t.Any, ...]) -> str:
-        return json.dumps(list(root_key), ensure_ascii=False, separators=(",", ":"))
+        return json.dumps(
+            list(root_key), ensure_ascii=False, separators=(",", ":")
+        )
 
     def _deserialize(self, payload: str) -> tuple[t.Any, ...]:
         parsed: t.Any = json.loads(payload)
@@ -184,7 +203,9 @@ class RedisRootQueue:
         added: int = 0
         for root_key in root_keys:
             normalized: tuple[t.Any, ...] = tuple(root_key)
-            if not normalized or not any(value is not None for value in normalized):
+            if not normalized or not any(
+                value is not None for value in normalized
+            ):
                 continue
             if int(
                 self._enqueue_script(
@@ -206,21 +227,23 @@ class RedisRootQueue:
         )
 
     def recover_inflight(self, *, to_hot: bool = True) -> int:
+        return self._recover_inflight(to_hot=to_hot)
+
+    def _recover_inflight(
+        self, *, to_hot: bool, batch_id: t.Optional[str] = None
+    ) -> int:
         target_key: str = self.hot_key if to_hot else self.backlog_key
         moved: list[str] = list(
             self._recover_script(
-                keys=[target_key, self.queued_set_key, self.inflight_key],
-                args=[],
+                keys=[
+                    target_key,
+                    self.queued_set_key,
+                    self.inflight_key,
+                    self.meta_key,
+                ],
+                args=[batch_id] if batch_id else [],
             )
             or []
-        )
-        self.client.hdel(
-            self.meta_key,
-            "inflight_batch_id",
-            "inflight_claimed_at",
-            "inflight_hot_count",
-            "inflight_backlog_count",
-            "inflight_size",
         )
         return len(moved)
 
@@ -254,7 +277,9 @@ class RedisRootQueue:
         inflight_size: int = int(self.client.llen(self.inflight_key) or 0)
         if inflight_size:
             return {
-                "batch_id": self.client.hget(self.meta_key, "inflight_batch_id"),
+                "batch_id": self.client.hget(
+                    self.meta_key, "inflight_batch_id"
+                ),
                 "root_keys": [
                     self._deserialize(item)
                     for item in self.client.lrange(self.inflight_key, 0, -1)
@@ -263,7 +288,8 @@ class RedisRootQueue:
                     self.client.hget(self.meta_key, "inflight_hot_count") or 0
                 ),
                 "backlog_count": int(
-                    self.client.hget(self.meta_key, "inflight_backlog_count") or 0
+                    self.client.hget(self.meta_key, "inflight_backlog_count")
+                    or 0
                 ),
             }
 
@@ -299,21 +325,14 @@ class RedisRootQueue:
             "backlog_count": len(backlog_claimed),
         }
 
-    def ack_batch(self, batch_id: t.Optional[str]) -> None:
-        current_batch_id: t.Optional[str] = self.client.hget(
-            self.meta_key,
-            "inflight_batch_id",
-        )
-        if current_batch_id and batch_id and current_batch_id != batch_id:
-            return
-        self.client.delete(self.inflight_key)
-        self.client.hdel(
-            self.meta_key,
-            "inflight_batch_id",
-            "inflight_claimed_at",
-            "inflight_hot_count",
-            "inflight_backlog_count",
-            "inflight_size",
+    def ack_batch(self, batch_id: t.Optional[str]) -> bool:
+        if not batch_id:
+            return False
+        return bool(
+            self._ack_script(
+                keys=[self.inflight_key, self.meta_key],
+                args=[batch_id],
+            )
         )
 
     def requeue_inflight(
@@ -322,13 +341,9 @@ class RedisRootQueue:
         *,
         to_hot: bool = True,
     ) -> int:
-        current_batch_id: t.Optional[str] = self.client.hget(
-            self.meta_key,
-            "inflight_batch_id",
-        )
-        if current_batch_id and batch_id and current_batch_id != batch_id:
+        if not batch_id:
             return 0
-        return self.recover_inflight(to_hot=to_hot)
+        return self._recover_inflight(to_hot=to_hot, batch_id=batch_id)
 
     def queued_size(self) -> int:
         return int(self.client.llen(self.hot_key) or 0) + int(

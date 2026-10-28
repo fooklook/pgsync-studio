@@ -13,15 +13,12 @@ from redis import Redis
 from .config_store import utcnow
 from .credentials import resolve_env_placeholders
 
-
 DEFAULT_LEASE_TTL_SECONDS = 300
 DEFAULT_LEASE_RENEW_INTERVAL_SECONDS = 60
 DEFAULT_LEASE_KEY_PREFIX = "pgsync:studio:job-lock"
 
 JOB_LEASE_TTL_ENV = "PGSYNC_STUDIO_JOB_LEASE_TTL_SECONDS"
-JOB_LEASE_RENEW_INTERVAL_ENV = (
-    "PGSYNC_STUDIO_JOB_LEASE_RENEW_INTERVAL_SECONDS"
-)
+JOB_LEASE_RENEW_INTERVAL_ENV = "PGSYNC_STUDIO_JOB_LEASE_RENEW_INTERVAL_SECONDS"
 JOB_LEASE_KEY_PREFIX_ENV = "PGSYNC_STUDIO_JOB_LEASE_KEY_PREFIX"
 
 RELEASE_SCRIPT = """
@@ -90,6 +87,9 @@ class NoopJobLease:
     def renew(self) -> bool:
         return True
 
+    def is_owned(self) -> bool:
+        return True
+
     def release(self) -> bool:
         return True
 
@@ -112,9 +112,7 @@ class RedisJobLease:
         self.client = client
         self.job_id = str(job_id)
         self.owner_instance_id = owner_instance_id
-        self.ttl_seconds = int(
-            ttl_seconds or resolve_job_lease_ttl_seconds()
-        )
+        self.ttl_seconds = int(ttl_seconds or resolve_job_lease_ttl_seconds())
         self.renew_interval_seconds = int(
             renew_interval_seconds
             or resolve_job_lease_renew_interval_seconds(self.ttl_seconds)
@@ -160,6 +158,7 @@ class RedisJobLease:
         )
         client = Redis.from_url(
             redis_url,
+            socket_connect_timeout=5,
             socket_timeout=5,
             retry_on_timeout=True,
             decode_responses=True,
@@ -191,6 +190,9 @@ class RedisJobLease:
                 str(self.ttl_seconds),
             )
         )
+
+    def is_owned(self) -> bool:
+        return self.client.get(self.key) == self.value
 
     def release(self) -> bool:
         return bool(

@@ -10,7 +10,6 @@ import time
 import typing as t
 from collections import defaultdict
 
-
 LabelMap = dict[str, t.Any]
 LabelKey = tuple[tuple[str, str], ...]
 
@@ -99,11 +98,7 @@ def _label_key(labels: LabelMap) -> LabelKey:
 
 
 def _escape_label_value(value: str) -> str:
-    return (
-        value.replace("\\", "\\\\")
-        .replace("\n", "\\n")
-        .replace('"', '\\"')
-    )
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
 def _format_float(value: t.Any) -> str:
@@ -130,10 +125,16 @@ def _sample_line(name: str, labels: LabelMap, value: t.Any) -> str:
 class _MetricStore:
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._counters: defaultdict[tuple[str, LabelKey], float] = defaultdict(float)
+        self._counters: defaultdict[tuple[str, LabelKey], float] = defaultdict(
+            float
+        )
         self._histogram_buckets: dict[tuple[str, LabelKey], list[int]] = {}
-        self._histogram_sum: defaultdict[tuple[str, LabelKey], float] = defaultdict(float)
-        self._histogram_count: defaultdict[tuple[str, LabelKey], int] = defaultdict(int)
+        self._histogram_sum: defaultdict[tuple[str, LabelKey], float] = (
+            defaultdict(float)
+        )
+        self._histogram_count: defaultdict[tuple[str, LabelKey], int] = (
+            defaultdict(int)
+        )
         self._histogram_bucket_values: dict[str, tuple[float, ...]] = {}
         self._help: dict[str, str] = {}
         self._types: dict[str, str] = {}
@@ -205,7 +206,9 @@ class _MetricStore:
             lines.append(f"# TYPE {name} {types.get(name, 'gauge')}")
             if types.get(name) == "histogram":
                 buckets = histogram_bucket_values.get(name, _DURATION_BUCKETS)
-                for (metric_name, labels), counts in sorted(histogram_buckets.items()):
+                for (metric_name, labels), counts in sorted(
+                    histogram_buckets.items()
+                ):
                     if metric_name != name:
                         continue
                     label_dict = dict(labels)
@@ -264,7 +267,11 @@ def record_pg_query(
 ) -> None:
     labels = _current_labels(
         {
-            "database": connection.get("database") if isinstance(connection, dict) else None,
+            "database": (
+                connection.get("database")
+                if isinstance(connection, dict)
+                else None
+            ),
             "operation": operation,
             "role": role,
             "status": status,
@@ -405,19 +412,44 @@ def _runtime_metric_labels(job: dict, runtime: dict) -> dict[str, str]:
     return labels
 
 
-def _append_dynamic_help(lines: list[str], name: str, metric_type: str, help_text: str) -> None:
+def _append_dynamic_help(
+    lines: list[str], name: str, metric_type: str, help_text: str
+) -> None:
     lines.append(f"# HELP {name} {help_text}")
     lines.append(f"# TYPE {name} {metric_type}")
 
 
 def _render_runtime_metrics(manager: t.Any) -> list[str]:
     lines: list[str] = []
+    if hasattr(manager, "recovery_health"):
+        recovery = manager.recovery_health()
+        for name, value, help_text in (
+            (
+                "pgsync_runner_recovery_loop_alive",
+                int(recovery["running"]),
+                "Whether the local task recovery supervisor is alive.",
+            ),
+            (
+                "pgsync_runner_recovery_cycle_errors",
+                recovery["cycle_errors"],
+                "Recovery cycles that failed in this process.",
+            ),
+            (
+                "pgsync_runner_recovery_last_cycle_timestamp_seconds",
+                recovery["last_cycle_timestamp_seconds"],
+                "Last time the local recovery supervisor began a cycle.",
+            ),
+        ):
+            _append_dynamic_help(lines, name, "gauge", help_text)
+            lines.append(_sample_line(name, {}, value))
     try:
         snapshot = manager.store.snapshot()
     except Exception:
         snapshot = {}
     jobs = snapshot.get("jobs") if isinstance(snapshot, dict) else []
-    runtimes = snapshot.get("job_runtime") if isinstance(snapshot, dict) else {}
+    runtimes = (
+        snapshot.get("job_runtime") if isinstance(snapshot, dict) else {}
+    )
     if not isinstance(jobs, list):
         jobs = []
     if not isinstance(runtimes, dict):
@@ -438,6 +470,31 @@ def _render_runtime_metrics(manager: t.Any) -> list[str]:
             "pgsync_job_error_state",
             "gauge",
             "Whether a PGSync Studio job currently reports an error state.",
+        ),
+        (
+            "pgsync_job_runner_alive",
+            "gauge",
+            "Whether this instance has a live runner thread for the job.",
+        ),
+        (
+            "pgsync_job_recovery_attempts",
+            "gauge",
+            "Consecutive task recovery attempts.",
+        ),
+        (
+            "pgsync_job_recovery_next_attempt_timestamp_seconds",
+            "gauge",
+            "Scheduled retry time, or zero when none is pending.",
+        ),
+        (
+            "pgsync_job_recovery_blocked",
+            "gauge",
+            "Whether automatic recovery requires a configuration or permission fix.",
+        ),
+        (
+            "pgsync_job_last_incremental_sync_timestamp_seconds",
+            "gauge",
+            "Last confirmed incremental batch timestamp.",
         ),
         (
             "pgsync_root_queue_size",
@@ -515,10 +572,41 @@ def _render_runtime_metrics(manager: t.Any) -> list[str]:
         labels = _runtime_metric_labels(job, runtime)
         status = str(runtime.get("status") or "")
         running = 1 if status in {"starting", "running", "stopping"} else 0
-        error_state = 1 if status == "failed" or runtime.get("last_error") else 0
+        error_state = (
+            1 if status == "failed" or runtime.get("last_error") else 0
+        )
         lines.append(_sample_line("pgsync_job_info", labels, 1))
         lines.append(_sample_line("pgsync_job_running", labels, running))
-        lines.append(_sample_line("pgsync_job_error_state", labels, error_state))
+        lines.append(
+            _sample_line("pgsync_job_error_state", labels, error_state)
+        )
+        if hasattr(manager, "runner_is_alive"):
+            lines.append(
+                _sample_line(
+                    "pgsync_job_runner_alive",
+                    labels,
+                    int(manager.runner_is_alive(manager.runners.get(job_id))),
+                )
+            )
+        for name, value in (
+            (
+                "pgsync_job_recovery_attempts",
+                runtime.get("runner_recovery_attempt_count"),
+            ),
+            (
+                "pgsync_job_recovery_next_attempt_timestamp_seconds",
+                runtime.get("runner_recovery_next_attempt_ts"),
+            ),
+            (
+                "pgsync_job_recovery_blocked",
+                bool(runtime.get("runner_recovery_blocked_reason")),
+            ),
+            (
+                "pgsync_job_last_incremental_sync_timestamp_seconds",
+                runtime.get("last_incremental_sync_ts"),
+            ),
+        ):
+            lines.append(_sample_line(name, labels, _numeric(value)))
         lines.append(
             _sample_line(
                 "pgsync_durable_change_events_enabled",
@@ -642,14 +730,18 @@ def _render_runtime_metrics(manager: t.Any) -> list[str]:
             _sample_line(
                 "pgsync_last_batch_root_keys",
                 {**labels, "type": "raw"},
-                _numeric(runtime.get("assembly_last_batch_raw_root_key_count")),
+                _numeric(
+                    runtime.get("assembly_last_batch_raw_root_key_count")
+                ),
             )
         )
         lines.append(
             _sample_line(
                 "pgsync_last_batch_root_keys",
                 {**labels, "type": "deduped"},
-                _numeric(runtime.get("assembly_last_batch_deduped_root_key_count")),
+                _numeric(
+                    runtime.get("assembly_last_batch_deduped_root_key_count")
+                ),
             )
         )
         lines.append(

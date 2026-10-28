@@ -3,6 +3,7 @@
 black
 coverage
 faker
+fakeredis[lua]
 flake8
 freezegun
 isort

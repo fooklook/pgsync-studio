@@ -128,6 +128,12 @@ complete supported names; do not enable deletion based only on a retention perio
 
 ## Runtime observations
 
+Eligible incremental tasks retry automatically after temporary dependency failures.
+Read [task auto-recovery](task-auto-recovery.md) for the prerequisites, limits,
+recovery diagnostics, and Kubernetes probe configuration. `/health/live` checks
+the local recovery supervisor without querying PostgreSQL, Redis, or Elasticsearch;
+it does not certify that every task has caught up.
+
 Use `/api/jobs/<id>/debug` to check actual runner/listener threads and Redis
 queues alongside the persisted task status. A zero root queue does not prove
 the durable outbox has caught up. Check `durable_event_backlog_present` and

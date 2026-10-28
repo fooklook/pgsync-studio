@@ -20,9 +20,10 @@ copyright notice and credits are preserved in [LICENSE](LICENSE),
 - Single-database and cross-database document assembly, soft deletes, and fixed relation filters.
 - Baseline synchronization, PostgreSQL triggers/notifications, durable outbox events, and recovery scans.
 - Redis coordination, per-job leases, persistent root queues, and PostgreSQL-backed configuration.
+- Automatic incremental-task recovery after temporary PostgreSQL or Redis failures, with bounded retry backoff and lease checks.
 - Optional replica reads with a batch-level WAL LSN fence, bounded waits, and primary fallback.
 - Optional daily outbox partitions, advance partition creation, retention checks, and consumer watermarks.
-- Prometheus metrics at `/metrics`.
+- Prometheus metrics at `/metrics` and supervisor liveness at `/health/live`.
 
 The current Web UI is in Simplified Chinese; the public setup documentation is bilingual.
 
@@ -91,7 +92,7 @@ python -m pip install --no-deps -e .
 Studio and replica-routing unit tests do not require running databases:
 
 ```sh
-python -m pytest -q tests/test_studio.py tests/test_studio_metrics.py tests/test_read_replica.py tests/test_nacos_read_replica.py
+python -m pytest -q tests/test_studio.py tests/test_studio_metrics.py tests/test_read_replica.py tests/test_nacos_read_replica.py tests/test_studio_recovery.py tests/test_studio_runtime_credentials.py
 python tools/check_public_export.py
 ```
 
@@ -107,6 +108,8 @@ when using the local JSON configuration store.
 
 Read [deployment and configuration](docs/deployment.md) before connecting your
 own databases. Nacos is optional; the default demo uses environment variables.
+See [task auto-recovery](docs/task-auto-recovery.md) for retry limits, queue
+persistence requirements, and Kubernetes health probes.
 Administrative access must be protected by an authenticated reverse proxy or
 private network: this version does not include user authentication or role-based
 access control. See [SECURITY.md](SECURITY.md).

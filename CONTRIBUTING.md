@@ -10,7 +10,7 @@ On POSIX shells:
 
 ```sh
 export PG_USER=studio ELASTICSEARCH=true
-python -m pytest -q tests/test_studio.py tests/test_studio_metrics.py tests/test_read_replica.py tests/test_nacos_read_replica.py
+python -m pytest -q tests/test_studio.py tests/test_studio_metrics.py tests/test_read_replica.py tests/test_nacos_read_replica.py tests/test_studio_recovery.py tests/test_studio_runtime_credentials.py
 ```
 
 In PowerShell:
@@ -18,11 +18,13 @@ In PowerShell:
 ```powershell
 $env:PG_USER = 'studio'
 $env:ELASTICSEARCH = 'true'
-python -m pytest -q tests/test_studio.py tests/test_studio_metrics.py tests/test_read_replica.py tests/test_nacos_read_replica.py
+python -m pytest -q tests/test_studio.py tests/test_studio_metrics.py tests/test_read_replica.py tests/test_nacos_read_replica.py tests/test_studio_recovery.py tests/test_studio_runtime_credentials.py
 ```
 
-These unit tests use temporary stores, mocks, and synthetic data. The remaining
-upstream tests exercise real PostgreSQL/Redis/Elasticsearch services. Run those
+These unit tests use temporary stores, mocks, and synthetic data. The recovery
+tests use `fakeredis[lua]` to exercise the batch scripts locally; they do not stop
+shared services. The remaining upstream tests exercise real PostgreSQL/Redis/
+Elasticsearch services. Run those
 only against disposable instances configured with a `testdb` database and the
 `PG_*`, `REDIS_*`, and `ELASTICSEARCH_*` settings. Some integration fixtures create
 or delete tables, databases, replication slots, and indices.

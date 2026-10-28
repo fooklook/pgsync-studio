@@ -73,10 +73,13 @@ def main():
                             raise AssertionError("Installed console did not become ready.")
                         time.sleep(0.2)
                 assert payload["ok"] and payload["data"]["jobs"] == []
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health/live", timeout=5) as response:
+                    health = json.load(response)
+                assert health["ok"] and health["recovery"]["running"]
                 for path in ["/", "/static/app.js", "/static/styles.css", "/favicon.ico", "/metrics"]:
                     with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=5) as response:
                         assert response.status == 200 and response.read()
-                print("PASS installed console bootstrap, static assets, and metrics over HTTP", flush=True)
+                print("PASS installed console bootstrap, liveness, static assets, and metrics over HTTP", flush=True)
             finally:
                 if os.name == "nt" and process.poll() is None:
                     # The Windows venv redirector can own a second Python

@@ -89,6 +89,15 @@ async def metrics(request: web.Request) -> web.StreamResponse:
     )
 
 
+async def liveness(request: web.Request) -> web.StreamResponse:
+    manager: SyncManager = request.app["manager"]
+    health = manager.recovery_health()
+    return web.json_response(
+        {"ok": health["running"], "recovery": health},
+        status=200 if health["running"] else 503,
+    )
+
+
 async def save_services(request: web.Request) -> web.StreamResponse:
     manager: SyncManager = request.app["manager"]
     payload: dict = await json_body(request)
@@ -275,6 +284,7 @@ def create_app() -> web.Application:
             web.get("/", index),
             web.get("/favicon.ico", favicon),
             web.get("/metrics", metrics),
+            web.get("/health/live", liveness),
             web.get("/api/bootstrap", bootstrap),
             web.post("/api/services", save_services),
             web.post("/api/connections/test", test_connection),

@@ -185,6 +185,18 @@ function localizeResumeStrategy(value) {
 }
 
 function buildResumeHint(runtime) {
+    if (runtime?.desired_state !== "stopped") {
+        if (runtime?.runner_recovery_blocked_reason) {
+            return `自动恢复已暂停，请检查配置或权限后手动启动。原因：${runtime.last_error || runtime.runner_recovery_blocked_reason}`;
+        }
+        if (runtime?.runner_recovery_next_attempt_ts) {
+            const next = new Date(Number(runtime.runner_recovery_next_attempt_ts) * 1000).toLocaleString();
+            return `等待自动恢复，第 ${runtime.runner_recovery_attempt_count || 1} 次重试预计 ${next} 执行。原因：${runtime.runner_recovery_last_error || runtime.last_error || "依赖暂时不可用"}`;
+        }
+        if (runtime?.runner_alive === false && ["running", "starting"].includes(runtime?.status)) {
+            return "同步线程已退出，等待自动恢复检查。";
+        }
+    }
     if (runtime?.phase === "awaiting_incremental_resume" && runtime?.baseline_completed) {
         return "已完成存量，等待恢复增量。服务重启后可从增量续跑。";
     }

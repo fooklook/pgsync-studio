@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import random
 import select
 import socket
 import subprocess
@@ -21,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg2
 from elasticsearch import Elasticsearch, helpers
+from redis.exceptions import AuthenticationError as RedisAuthenticationError
 
 from pgsync.base import Base as PGSyncBase
 
@@ -813,8 +815,10 @@ class NativeProcessRunner:
                 self.job_id,
                 f"原生 PGSync 进程异常退出，退出码：{exit_code}",
             )
-        self.manager.update_runtime(self.job_id, patch)
-        self.manager.on_runner_finished(self.job_id)
+        try:
+            self.manager.update_runtime(self.job_id, patch)
+        finally:
+            self.manager.on_runner_finished(self.job_id, self)
 
     def stop(self) -> None:
         self.stop_requested = True
@@ -887,21 +891,7 @@ class NativeProcessRunner:
                 self.job_id,
                 f"原生 PGSync 同步失败：{exc}",
             )
-            runtime: dict = self.store.get_job_runtime(self.job_id)
-            lease_lost: bool = bool(
-                self.lease_lost or runtime.get("phase") == "lease_lost"
-            )
-            self.manager.update_runtime(
-                self.job_id,
-                {
-                    "status": "failed",
-                    "phase": "lease_lost" if lease_lost else "failed",
-                    "last_error": (
-                        runtime.get("last_error") if lease_lost else str(exc)
-                    ),
-                    "pid": None,
-                },
-            )
+            self.manager.record_runner_failure(self.job_id, self, exc)
         else:
             if self.lease_lost:
                 patch: dict = {
@@ -917,9 +907,13 @@ class NativeProcessRunner:
                 patch["pid"] = None
             self.manager.update_runtime(self.job_id, patch)
         finally:
-            self._terminate_process(self.bootstrap_process)
-            self._terminate_process(self.daemon_process)
-            self.manager.on_runner_finished(self.job_id)
+            try:
+                try:
+                    self._terminate_process(self.bootstrap_process)
+                finally:
+                    self._terminate_process(self.daemon_process)
+            finally:
+                self.manager.on_runner_finished(self.job_id, self)
 
     def _native_command(self, *, daemon: bool, bootstrap: bool) -> list[str]:
         command: list[str] = [
@@ -1386,21 +1380,23 @@ class AssemblyRunner:
 
     def run(self) -> None:
         metric_token = set_metrics_context(self.job)
-        self.manager.update_runtime(
-            self.job_id,
-            {
-                "status": "running",
-                "mode": "assembly",
-                "phase": (
-                    self.incremental_phase
-                    if self.incremental_only
-                    else self.full_sync_phase
-                ),
-                "last_error": "",
-                "resume_strategy": self.resume_strategy,
-            },
-        )
         try:
+            self.manager.update_runtime(
+                self.job_id,
+                {
+                    "status": "running",
+                    "mode": "assembly",
+                    "health_status": HEALTH_STATUS_RUNNING,
+                    "health_reason": "",
+                    "phase": (
+                        self.incremental_phase
+                        if self.incremental_only
+                        else self.full_sync_phase
+                    ),
+                    "last_error": "",
+                    "resume_strategy": self.resume_strategy,
+                },
+            )
             search = SearchAdapter(self.store.snapshot()["services"])
             search.ensure_index(
                 self.job["index_name"],
@@ -1440,20 +1436,7 @@ class AssemblyRunner:
         except Exception as exc:
             logger.exception("应用层组装同步失败")
             self.log(f"应用层组装同步失败：{exc}")
-            runtime: dict = self.store.get_job_runtime(self.job_id)
-            lease_lost: bool = bool(
-                self.lease_lost or runtime.get("phase") == "lease_lost"
-            )
-            self.manager.update_runtime(
-                self.job_id,
-                {
-                    "status": "failed",
-                    "phase": "lease_lost" if lease_lost else "failed",
-                    "last_error": (
-                        runtime.get("last_error") if lease_lost else str(exc)
-                    ),
-                },
-            )
+            self.manager.record_runner_failure(self.job_id, self, exc)
         else:
             if self.lease_lost:
                 patch = {
@@ -1467,8 +1450,10 @@ class AssemblyRunner:
                 )
             self.manager.update_runtime(self.job_id, patch)
         finally:
-            self.manager.on_runner_finished(self.job_id)
-            reset_metrics_context(metric_token)
+            try:
+                self.manager.on_runner_finished(self.job_id, self)
+            finally:
+                reset_metrics_context(metric_token)
 
     def supports_batch_one_hop_full_sync(self) -> bool:
         root_id: str = self.root_table["id"]
@@ -1731,8 +1716,10 @@ class AssemblyRunner:
             read_plan=read_plan,
         )
         if actions:
+            self.manager.assert_job_lease(self.job_id, self)
             search.bulk(actions)
         if deletions:
+            self.manager.assert_job_lease(self.job_id, self)
             search.delete_many(self.job["index_name"], deletions)
         if len(root_keys) <= 5:
             logger.warning(
@@ -1796,8 +1783,10 @@ class AssemblyRunner:
                     read_plan=resolved_read_plan,
                 )
                 if actions:
+                    self.manager.assert_job_lease(self.job_id, self)
                     search.bulk(actions)
                 if deletions:
+                    self.manager.assert_job_lease(self.job_id, self)
                     search.delete_many(self.job["index_name"], deletions)
                 total_docs += len(actions)
                 if use_seek_pagination:
@@ -1874,8 +1863,10 @@ class AssemblyRunner:
                     }
                 )
             if actions:
+                self.manager.assert_job_lease(self.job_id, self)
                 search.bulk(actions)
             if deletions:
+                self.manager.assert_job_lease(self.job_id, self)
                 search.delete_many(self.job["index_name"], deletions)
             total_docs += len(actions)
             offset += len(rows)
@@ -1924,8 +1915,10 @@ class AssemblyRunner:
                     }
                 )
             if actions:
+                self.manager.assert_job_lease(self.job_id, self)
                 search.bulk(actions)
             if deletions:
+                self.manager.assert_job_lease(self.job_id, self)
                 search.delete_many(self.job["index_name"], deletions)
             total_docs += len(actions)
             offset += len(rows)
@@ -2896,20 +2889,7 @@ class CrossDatabaseHybridRunner:
                 self.job_id,
                 f"跨库 native/assembly 混合同步失败：{exc}",
             )
-            runtime: dict = self.store.get_job_runtime(self.job_id)
-            lease_lost: bool = bool(
-                self.lease_lost or runtime.get("phase") == "lease_lost"
-            )
-            self.manager.update_runtime(
-                self.job_id,
-                {
-                    "status": "failed",
-                    "phase": "lease_lost" if lease_lost else "failed",
-                    "last_error": (
-                        runtime.get("last_error") if lease_lost else str(exc)
-                    ),
-                },
-            )
+            self.manager.record_runner_failure(self.job_id, self, exc)
         else:
             if self.lease_lost:
                 patch = {
@@ -2928,9 +2908,13 @@ class CrossDatabaseHybridRunner:
                 }
             self.manager.update_runtime(self.job_id, patch)
         finally:
-            self._terminate_process(self.setup_process)
-            self._terminate_process(self.daemon_process)
-            self.manager.on_runner_finished(self.job_id)
+            try:
+                try:
+                    self._terminate_process(self.setup_process)
+                finally:
+                    self._terminate_process(self.daemon_process)
+            finally:
+                self.manager.on_runner_finished(self.job_id, self)
 
     def _terminate_process(
         self,
@@ -3271,7 +3255,7 @@ class CrossDatabaseHybridRunnerV2:
         return {}
 
     def _drain_durable_change_events(self) -> bool:
-        if not self.durable_change_events_enabled:
+        if not self.durable_change_events_enabled or self.stop_event.is_set():
             return False
         runtime: dict = self.store.get_job_runtime(self.job_id)
         cursor_patch: dict[str, int] = deepcopy(
@@ -3386,6 +3370,7 @@ class CrossDatabaseHybridRunnerV2:
 
         if not total_events and not lag_by_group:
             return False
+        self.manager.assert_job_lease(self.job_id, self)
         self.manager.update_runtime(
             self.job_id,
             {
@@ -4378,11 +4363,16 @@ class CrossDatabaseHybridRunnerV2:
         for stop_event in self.native_listener_stop_events.values():
             stop_event.set()
         for connection_id in list(self.native_listener_states.keys()):
-            self._update_listener_state(
-                connection_id,
-                state="stopped",
-                reason="stopped",
-            )
+            try:
+                self._update_listener_state(
+                    connection_id,
+                    state="stopped",
+                    reason="stopped",
+                )
+            except Exception:
+                logger.exception(
+                    "Could not persist stopped listener %s", connection_id
+                )
 
     def _cross_db_recovery_scan_interval_seconds(self) -> int:
         configured: t.Any = self.job.get(
@@ -4916,9 +4906,11 @@ class CrossDatabaseHybridRunnerV2:
         actions: list[dict],
         deletions: list[str],
     ) -> tuple[int, int]:
+        self.manager.assert_job_lease(self.job_id, self)
         if actions:
             search.bulk(actions)
         if deletions:
+            self.manager.assert_job_lease(self.job_id, self)
             search.delete_many(self.job["index_name"], deletions)
         return len(actions), len(deletions)
 
@@ -5207,7 +5199,11 @@ class CrossDatabaseHybridRunnerV2:
             )
             elapsed_seconds: float = time.perf_counter() - started_at
             elapsed_ms: int = int(elapsed_seconds * 1000)
-            self.root_queue.ack_batch(batch.get("batch_id"))
+            self.manager.assert_job_lease(self.job_id, self)
+            if self.root_queue.ack_batch(batch.get("batch_id")) is False:
+                raise StudioError(
+                    "Batch ownership changed; acknowledgement was rejected."
+                )
             with self.queue_lock:
                 self._refresh_queue_runtime(
                     extra={
@@ -5283,7 +5279,7 @@ class CrossDatabaseHybridRunnerV2:
                 elapsed_seconds=elapsed_seconds,
                 status="error",
             )
-            if batch and batch.get("batch_id"):
+            if batch and batch.get("batch_id") and not self.lease_lost:
                 with self.queue_lock:
                     self.root_queue.requeue_inflight(
                         batch.get("batch_id"),
@@ -5292,8 +5288,10 @@ class CrossDatabaseHybridRunnerV2:
                     self._refresh_queue_runtime()
             raise
         finally:
-            self._clear_incremental_batch_running()
-            self.incremental_run_lock.release()
+            try:
+                self._clear_incremental_batch_running()
+            finally:
+                self.incremental_run_lock.release()
 
     def _build_full_sync_cursor_seed(self) -> dict[str, dict[str, t.Any]]:
         return self.assembly_runner.build_cursor_seed()
@@ -5498,20 +5496,7 @@ class CrossDatabaseHybridRunnerV2:
                 self.job_id,
                 f"Native capture / assembly rebuild sync failed: {exc}",
             )
-            runtime: dict = self.store.get_job_runtime(self.job_id)
-            lease_lost: bool = bool(
-                self.lease_lost or runtime.get("phase") == "lease_lost"
-            )
-            self.manager.update_runtime(
-                self.job_id,
-                {
-                    "status": "failed",
-                    "phase": "lease_lost" if lease_lost else "failed",
-                    "last_error": (
-                        runtime.get("last_error") if lease_lost else str(exc)
-                    ),
-                },
-            )
+            self.manager.record_runner_failure(self.job_id, self, exc)
         else:
             if self.lease_lost:
                 patch = {
@@ -5530,9 +5515,14 @@ class CrossDatabaseHybridRunnerV2:
                 }
             self.manager.update_runtime(self.job_id, patch)
         finally:
-            self._stop_native_listeners()
-            self.manager.on_runner_finished(self.job_id)
-            reset_metrics_context(metric_token)
+            try:
+                self.manager.signal_runner_stop(self)
+                self._stop_native_listeners()
+            finally:
+                try:
+                    self.manager.on_runner_finished(self.job_id, self)
+                finally:
+                    reset_metrics_context(metric_token)
 
     def _terminate_process(
         self,
@@ -5610,6 +5600,11 @@ class SyncManager:
         )
         self._recovery_stop_event: threading.Event = threading.Event()
         self._recovery_thread: t.Optional[threading.Thread] = None
+        self._shutting_down: bool = False
+        self._recovery_last_cycle_at: t.Optional[str] = None
+        self._recovery_last_cycle_ts: float = 0.0
+        self._recovery_last_error: str = ""
+        self._recovery_cycle_errors: int = 0
         (
             self.connection_auto_discovery_hour,
             self.connection_auto_discovery_minute,
@@ -5647,7 +5642,12 @@ class SyncManager:
             dict[str, t.Any]
         ] = None
         self.runtime_tuning = RuntimeTuningConfig()
-        self.reconcile_runtime_states()
+        try:
+            self.reconcile_runtime_states()
+        except Exception:
+            logger.exception(
+                "Initial runtime reconciliation failed; will retry"
+            )
 
     @property
     def instance_id_path(self) -> str:
@@ -7472,7 +7472,9 @@ class SyncManager:
         """Return whether a failed runner may safely resume incrementally."""
         if runtime.get("status") != "failed":
             return False
-        if runtime.get("phase") != "failed":
+        if runtime.get("phase") not in {"failed", "lease_lost"}:
+            return False
+        if runtime.get("runner_recovery_blocked_reason"):
             return False
         if runtime.get("assembly_recovery_requires_full_sync"):
             return False
@@ -7523,6 +7525,10 @@ class SyncManager:
         delay_seconds: float = self.failed_recovery_backoff_seconds(
             attempt_count
         )
+        delay_seconds = min(
+            self.failed_recovery_max_delay_seconds,
+            delay_seconds * random.uniform(1.0, 1.1),
+        )
         now_ts: float = utc_timestamp()
         patch: dict = {
             "runner_recovery_attempt_count": attempt_count,
@@ -7568,7 +7574,13 @@ class SyncManager:
         runtime: dict,
     ) -> None:
         """Clear consecutive-failure backoff after a stable resumed run."""
-        if runtime.get("status") != "running":
+        runner = self.runners.get(job_id)
+        if (
+            runtime.get("status") != "running"
+            or not self.runner_is_alive(runner)
+            or getattr(runner, "lease_lost", False)
+            or getattr(runner, "stop_requested", False)
+        ):
             return
         try:
             attempt_count: int = int(
@@ -7679,7 +7691,7 @@ class SyncManager:
                 job_id,
                 exc,
             )
-            return {}
+            raise
         if isinstance(lease, NoopJobLease):
             return {}
         try:
@@ -7690,7 +7702,7 @@ class SyncManager:
                 job_id,
                 exc,
             )
-            return {}
+            raise
 
     def job_has_active_lease(
         self,
@@ -7699,48 +7711,233 @@ class SyncManager:
     ) -> bool:
         return bool(self.describe_job_holder(job_id, services))
 
+    @staticmethod
+    def runner_is_alive(runner: t.Any) -> bool:
+        thread = getattr(runner, "thread", None)
+        return bool(thread and thread.is_alive())
+
+    @staticmethod
+    def signal_runner_stop(runner: t.Any, *, lease_lost: bool = False) -> None:
+        """Stop new work without requiring PostgreSQL or Redis to respond."""
+        for target in (runner, getattr(runner, "assembly_runner", None)):
+            if target is None:
+                continue
+            if hasattr(target, "stop_requested"):
+                target.stop_requested = True
+            if lease_lost:
+                target.lease_lost = True
+            event = getattr(target, "stop_event", None)
+            if event is not None:
+                event.set()
+            for event in list(
+                (
+                    getattr(target, "native_listener_stop_events", None) or {}
+                ).values()
+            ):
+                event.set()
+
+    @staticmethod
+    def runner_has_live_workers(runner: t.Any) -> bool:
+        """A finalizer may ignore itself, but never an unfinished child."""
+        threads = [
+            getattr(runner, "thread", None),
+            getattr(runner, "recovery_scan_thread", None),
+            *(getattr(runner, "native_listener_threads", None) or {}).values(),
+        ]
+        if any(
+            thread is not None
+            and thread is not threading.current_thread()
+            and thread.is_alive()
+            for thread in threads
+        ):
+            return True
+        return any(
+            process is not None and process.poll() is None
+            for process in (
+                getattr(runner, name, None)
+                for name in (
+                    "bootstrap_process",
+                    "setup_process",
+                    "daemon_process",
+                )
+            )
+        )
+
+    @staticmethod
+    def recovery_blocked_reason(exc: Exception) -> str:
+        original = getattr(exc, "orig", exc)
+        sqlstate = str(
+            getattr(original, "pgcode", None)
+            or getattr(original, "sqlstate", None)
+            or ""
+        )
+        if isinstance(exc, RedisAuthenticationError) or sqlstate.startswith(
+            "28"
+        ):
+            return "authentication_error"
+        if sqlstate.startswith("42"):
+            return "database_schema_or_permission_error"
+        if getattr(exc, "status_code", None) in {400, 401, 403}:
+            return "search_configuration_or_permission_error"
+        return ""
+
+    def record_runner_failure(
+        self, job_id: str, runner: t.Any, exc: Exception
+    ) -> None:
+        """Failure reporting is best effort; it must not prevent cleanup."""
+        try:
+            with self._lock:
+                current = self.runners.get(job_id)
+                if current is not None and current is not runner:
+                    return
+                runtime = self.store.get_job_runtime(job_id)
+                if runtime.get("owner") not in (None, "", self.instance_id):
+                    return
+                lease_lost = bool(
+                    getattr(runner, "lease_lost", False)
+                    or runtime.get("phase") == "lease_lost"
+                )
+                self.update_runtime(
+                    job_id,
+                    {
+                        "status": "failed",
+                        "phase": "lease_lost" if lease_lost else "failed",
+                        "last_error": (
+                            runtime.get("last_error") or str(exc)
+                            if lease_lost
+                            and runtime.get("phase") == "lease_lost"
+                            else str(exc)
+                        ),
+                        "health_status": HEALTH_STATUS_DEGRADED,
+                        "runner_recovery_blocked_reason": self.recovery_blocked_reason(
+                            exc
+                        ),
+                    },
+                )
+        except Exception:
+            logger.exception("Could not persist runner failure for %s", job_id)
+
+    def _record_recovery_failure(self, job_id: str, exc: Exception) -> None:
+        logger.warning("Could not auto-resume job %s: %s", job_id, exc)
+        try:
+            current = self.store.get_job_runtime(job_id)
+            if current.get("desired_state") == "stopped":
+                return
+            if current.get("owner") not in (None, "", self.instance_id):
+                return  # An unreachable Redis must not fail a peer's task.
+            runtime = self.update_runtime(
+                job_id,
+                {
+                    "status": "failed",
+                    "phase": "failed",
+                    "last_error": str(exc),
+                    "health_status": HEALTH_STATUS_RECOVERING,
+                    "runner_recovery_next_attempt_ts": None,
+                    "runner_recovery_blocked_reason": self.recovery_blocked_reason(
+                        exc
+                    ),
+                },
+            )
+            self.schedule_failed_runtime_recovery(job_id, runtime)
+        except Exception:
+            logger.exception(
+                "Could not persist recovery attempt for %s", job_id
+            )
+
+    def reap_finished_runners(self) -> None:
+        """Also recover runners whose exception handler/finalizer failed."""
+        with self._lock:
+            for job_id, runner in list(self.runners.items()):
+                if self.runner_is_alive(runner):
+                    continue
+                try:
+                    self.signal_runner_stop(runner)
+                    for name in (
+                        "bootstrap_process",
+                        "setup_process",
+                        "daemon_process",
+                    ):
+                        process = getattr(runner, name, None)
+                        if process is not None:
+                            runner._terminate_process(process)
+                    try:
+                        runtime = self.store.get_job_runtime(job_id)
+                        if runtime.get("status") in {"running", "starting"}:
+                            self.record_runner_failure(
+                                job_id,
+                                runner,
+                                StudioError(
+                                    "Runner thread exited; recovering from the saved checkpoint."
+                                ),
+                            )
+                    except Exception:
+                        logger.exception(
+                            "Could not inspect exited runner %s", job_id
+                        )
+                    self.on_runner_finished(job_id, runner)
+                except Exception:
+                    logger.exception(
+                        "Could not clean up exited runner %s", job_id
+                    )
+
     def run_recovery_cycle(self) -> list[str]:
         with self._lock:
             resumable_job_ids: list[str] = self.reconcile_runtime_states()
         started_job_ids: list[str] = []
         for job_id in resumable_job_ids:
             with self._lock:
-                runtime: dict = self.store.get_job_runtime(job_id)
-                if not self.runtime_should_resume_incremental(job_id, runtime):
-                    continue
-                if job_id in self.runners or self.job_has_active_lease(job_id):
-                    continue
                 try:
+                    if (
+                        self._shutting_down
+                        or self._recovery_stop_event.is_set()
+                    ):
+                        break
+                    runtime: dict = self.store.get_job_runtime(job_id)
+                    if not self.runtime_should_resume_incremental(
+                        job_id, runtime
+                    ):
+                        continue
+                    if job_id in self.runners or self.job_has_active_lease(
+                        job_id
+                    ):
+                        continue
                     self.start_job(job_id)
                 except Exception as exc:
-                    logger.warning(
-                        "Could not auto-resume incremental job %s: %s",
-                        job_id,
-                        exc,
-                    )
-                    self.append_log(job_id, f"自动恢复增量任务失败：{exc}")
-                    failed_runtime: dict = self.update_runtime(
-                        job_id,
-                        {
-                            "status": "failed",
-                            "phase": "failed",
-                            "last_error": str(exc),
-                        },
-                    )
-                    self.schedule_failed_runtime_recovery(
-                        job_id,
-                        failed_runtime,
-                    )
+                    self._record_recovery_failure(job_id, exc)
                     continue
             started_job_ids.append(job_id)
         return started_job_ids
 
     def _recovery_loop(self) -> None:
-        self.run_recovery_cycle()
-        while not self._recovery_stop_event.wait(
-            self.recovery_poll_interval_seconds
-        ):
-            self.run_recovery_cycle()
+        while not self._recovery_stop_event.is_set():
+            self._recovery_last_cycle_at = utcnow()
+            self._recovery_last_cycle_ts = utc_timestamp()
+            try:
+                self.run_recovery_cycle()
+                self._recovery_last_error = ""
+            except Exception as exc:
+                self._recovery_last_error = str(exc)
+                self._recovery_cycle_errors += 1
+                logger.exception("Runtime recovery cycle failed; will retry")
+            if self._recovery_stop_event.wait(
+                self.recovery_poll_interval_seconds
+            ):
+                break
+
+    def recovery_health(self) -> dict:
+        """Local supervisor health; dependency outages must not restart pods."""
+        return {
+            "running": bool(
+                self._recovery_thread
+                and self._recovery_thread.is_alive()
+                and not self._recovery_stop_event.is_set()
+            ),
+            "last_cycle_at": self._recovery_last_cycle_at,
+            "last_cycle_timestamp_seconds": self._recovery_last_cycle_ts,
+            "last_error": self._recovery_last_error,
+            "cycle_errors": self._recovery_cycle_errors,
+            "poll_interval_seconds": self.recovery_poll_interval_seconds,
+        }
 
     def start_background_recovery(self) -> None:
         with self._lock:
@@ -7758,7 +7955,6 @@ class SyncManager:
         with self._lock:
             self._recovery_stop_event.set()
             thread = self._recovery_thread
-            self._recovery_thread = None
         if (
             thread
             and thread.is_alive()
@@ -7771,6 +7967,7 @@ class SyncManager:
         *,
         join_timeout_seconds: float = 15.0,
     ) -> None:
+        self._shutting_down = True
         self.stop_durable_outbox_partition_maintenance_scheduler()
         self.stop_durable_outbox_cleanup_scheduler()
         self.stop_connection_auto_discovery_scheduler()
@@ -7874,67 +8071,65 @@ class SyncManager:
 
     def reconcile_runtime_states(self) -> list[str]:
         """Clear stale runtime state left behind after a studio restart."""
+        self.reap_finished_runners()
         snapshot: dict = self.store.snapshot()
         services: dict = snapshot.get("services", {})
         resumable_job_ids: list[str] = []
         for job_id, runtime in snapshot.get("job_runtime", {}).items():
-            if job_id in self.runners:
-                self.clear_stable_runner_recovery_state(job_id, runtime)
-                continue
-            if self.job_has_active_lease(job_id, services):
-                continue
-            resumable_after_restart: bool = (
-                self.runtime_should_resume_incremental(
-                    job_id,
-                    runtime,
-                )
-            )
-            if runtime.get("status") in {"starting", "running", "stopping"}:
-                patch: dict = self.build_restart_runtime_patch(
-                    runtime,
-                    resumable_after_restart=resumable_after_restart,
-                )
-                self.store.update_job_runtime(job_id, patch)
-                if resumable_after_restart:
+            try:
+                if self._reconcile_job_runtime(job_id, runtime, services):
                     resumable_job_ids.append(job_id)
-                continue
-            if runtime.get("status") == "failed":
-                if not self.failed_runtime_should_auto_recover(
-                    job_id,
-                    runtime,
-                ):
-                    continue
-                runtime = self.schedule_failed_runtime_recovery(
-                    job_id,
-                    runtime,
-                )
-                if not self.failed_runtime_recovery_is_due(runtime):
-                    continue
-                last_error: str = str(runtime.get("last_error") or "")
-                patch = self.build_restart_runtime_patch(
-                    runtime,
-                    resumable_after_restart=True,
-                )
-                patch.update(
-                    {
-                        "last_error": last_error,
-                        "runner_recovery_next_attempt_ts": None,
-                        "runner_recovery_started_at": utcnow(),
-                        "runner_recovery_started_ts": utc_timestamp(),
-                    }
-                )
-                self.store.update_job_runtime(job_id, patch)
-                resumable_job_ids.append(job_id)
-                continue
-            if runtime.get("status") == "stopped" and resumable_after_restart:
-                if runtime.get("phase") != PHASE_AWAITING_INCREMENTAL_RESUME:
-                    patch = self.build_restart_runtime_patch(
-                        runtime,
-                        resumable_after_restart=True,
-                    )
-                    self.store.update_job_runtime(job_id, patch)
-                resumable_job_ids.append(job_id)
+            except Exception as exc:
+                self._record_recovery_failure(job_id, exc)
         return resumable_job_ids
+
+    def _reconcile_job_runtime(
+        self, job_id: str, runtime: dict, services: dict
+    ) -> bool:
+        if job_id in self.runners:
+            self.clear_stable_runner_recovery_state(job_id, runtime)
+            return False
+        resumable = self.runtime_should_resume_incremental(job_id, runtime)
+        if runtime.get("status") == "failed":
+            if not self.failed_runtime_should_auto_recover(job_id, runtime):
+                return False
+            runtime = self.schedule_failed_runtime_recovery(job_id, runtime)
+            if not self.failed_runtime_recovery_is_due(runtime):
+                return False
+        if self.job_has_active_lease(job_id, services):
+            return False
+        if runtime.get("status") in {"starting", "running", "stopping"}:
+            self.store.update_job_runtime(
+                job_id,
+                self.build_restart_runtime_patch(
+                    runtime, resumable_after_restart=resumable
+                ),
+            )
+            return resumable
+        if runtime.get("status") == "failed":
+            patch = self.build_restart_runtime_patch(
+                runtime, resumable_after_restart=True
+            )
+            patch.update(
+                {
+                    "last_error": str(runtime.get("last_error") or ""),
+                    "runner_recovery_next_attempt_ts": None,
+                    "runner_recovery_started_at": utcnow(),
+                    "runner_recovery_started_ts": utc_timestamp(),
+                }
+            )
+            self.store.update_job_runtime(job_id, patch)
+            return True
+        if runtime.get("status") == "stopped" and resumable:
+            if runtime.get("phase") != PHASE_AWAITING_INCREMENTAL_RESUME:
+                self.store.update_job_runtime(
+                    job_id,
+                    self.build_restart_runtime_patch(
+                        runtime, resumable_after_restart=True
+                    ),
+                )
+            return True
+        return False
 
     def bootstrap_payload(self) -> dict:
         payload: dict = self.store.snapshot()
@@ -7948,6 +8143,12 @@ class SyncManager:
         ]
         self.attach_index_document_counts(payload)
         payload["running_jobs"] = sorted(self.runners.keys())
+        payload["runner_recovery"] = self.recovery_health()
+        for job_id, runtime in payload.get("job_runtime", {}).items():
+            if runtime.get("owner") in (None, "", self.instance_id):
+                runtime["runner_alive"] = self.runner_is_alive(
+                    self.runners.get(job_id)
+                )
         payload["durable_outbox_cleanup"] = (
             self.durable_outbox_cleanup_status()
         )
@@ -8040,6 +8241,11 @@ class SyncManager:
         stop_event: threading.Event,
     ) -> None:
         while not stop_event.wait(lease.renew_interval_seconds):
+            if self.runners.get(job_id) is not runner:
+                return
+            if not self.runner_is_alive(runner):
+                self.on_runner_finished(job_id, runner)
+                return
             try:
                 renewed: bool = bool(lease.renew())
             except Exception as exc:
@@ -8047,29 +8253,66 @@ class SyncManager:
                 self.append_log(job_id, f"Redis job lease 续租失败：{exc}")
                 renewed = False
             if not renewed:
-                self.update_runtime(
+                self.signal_runner_stop(runner, lease_lost=True)
+                try:
+                    if hasattr(runner, "handle_lease_lost"):
+                        runner.handle_lease_lost()
+                except Exception:
+                    logger.exception(
+                        "Lease-loss cleanup failed for %s", job_id
+                    )
+                self.record_runner_failure(
                     job_id,
-                    {
-                        "status": "failed",
-                        "phase": "lease_lost",
-                        "heartbeat_at": utcnow(),
-                        "last_error": (
-                            "Redis job lease lost; the current Studio instance no longer owns this task."
-                        ),
-                    },
+                    runner,
+                    StudioError(
+                        "Redis job lease lost; waiting to safely reacquire ownership."
+                    ),
                 )
-                if hasattr(runner, "handle_lease_lost"):
-                    runner.handle_lease_lost()
-                else:
-                    runner.stop()
                 return
-            self.update_runtime(
-                job_id,
-                {
-                    "owner": self.instance_id,
-                    "heartbeat_at": utcnow(),
-                },
+            try:
+                with self._lock:
+                    if (
+                        self.runners.get(job_id) is not runner
+                        or stop_event.is_set()
+                    ):
+                        return
+                    self.update_runtime(
+                        job_id,
+                        {"owner": self.instance_id, "heartbeat_at": utcnow()},
+                    )
+            except Exception:
+                logger.exception(
+                    "Could not persist job heartbeat for %s", job_id
+                )
+
+    def assert_job_lease(self, job_id: str, runner: t.Any) -> None:
+        """Recheck ownership before writes and acknowledgements after a stall."""
+        if getattr(runner, "lease_lost", False):
+            raise StudioError("Job lease lost; batch remains unconfirmed.")
+        lease = self.job_leases.get(job_id)
+        current = self.runners.get(job_id)
+        if lease is None and current is None:
+            return  # Unmanaged runners used by previews and isolated tests.
+        if (
+            current is not runner
+            and getattr(current, "assembly_runner", None) is not runner
+        ):
+            raise StudioError(
+                "Runner was replaced; batch remains unconfirmed."
             )
+        if lease is None:
+            self.signal_runner_stop(current, lease_lost=True)
+            raise StudioError(
+                "Job lease is unavailable; batch remains unconfirmed."
+            )
+        try:
+            owned = lease.is_owned()
+        except Exception:
+            self.signal_runner_stop(current, lease_lost=True)
+            raise
+        if not owned:
+            self.signal_runner_stop(current, lease_lost=True)
+            raise StudioError("Job lease lost; batch remains unconfirmed.")
 
     def start_job_lease_monitor(
         self,
@@ -8114,8 +8357,11 @@ class SyncManager:
                 logger.exception("Failed to release job lease: %s", job_id)
         if clear_owner:
             job_exists: bool = self.store.get_job(job_id) is not None
-            runtime_exists: bool = bool(self.store.get_job_runtime(job_id))
+            runtime = self.store.get_job_runtime(job_id)
+            runtime_exists: bool = bool(runtime)
             if not job_exists and not runtime_exists:
+                return
+            if runtime.get("owner") not in (None, "", self.instance_id):
                 return
             self.update_runtime(
                 job_id,
@@ -8125,10 +8371,33 @@ class SyncManager:
                 },
             )
 
-    def on_runner_finished(self, job_id: str) -> None:
-        self.runners.pop(job_id, None)
-        self.release_job_lease(job_id, clear_owner=True)
-        self.schedule_failed_runtime_recovery(job_id)
+    def on_runner_finished(self, job_id: str, runner: t.Any = None) -> None:
+        with self._lock:
+            current = self.runners.get(job_id)
+            if (
+                runner is not None
+                and current is not None
+                and current is not runner
+            ):
+                return
+            if runner is not None:
+                self.signal_runner_stop(runner)
+                if self.runner_has_live_workers(runner):
+                    return  # The reaper retries after all old workers exit.
+            self.runners.pop(job_id, None)
+            try:
+                self.release_job_lease(job_id, clear_owner=True)
+            except Exception:
+                logger.exception(
+                    "Could not persist released ownership for %s", job_id
+                )
+            try:
+                self.schedule_failed_runtime_recovery(job_id)
+            except Exception:
+                logger.exception(
+                    "Could not schedule recovery for %s; will reconcile",
+                    job_id,
+                )
 
     def validate_connection_payload(self, payload: dict) -> dict:
         connection: dict = {
@@ -9681,6 +9950,10 @@ class SyncManager:
 
     def start_job(self, job_id: str) -> dict:
         with self._lock:
+            if self._shutting_down:
+                raise StudioError(
+                    "Studio is shutting down; retry after restart."
+                )
             if job_id in self.runners:
                 raise StudioError(f"任务 {job_id} 已在运行中。")
             job: t.Optional[dict] = self.store.get_job(job_id)
@@ -9700,6 +9973,8 @@ class SyncManager:
             if not services["search"].get("url"):
                 raise StudioError("启动同步任务前请先配置 Elasticsearch。")
             lease = self.acquire_job_lease(job_id, services)
+            self.job_leases[job_id] = lease
+            runner = None
             try:
                 starting_patch: dict = {
                     "status": "starting",
@@ -9708,6 +9983,7 @@ class SyncManager:
                     "owner": self.instance_id,
                     "heartbeat_at": utcnow(),
                     "resume_strategy": resume_strategy,
+                    "runner_recovery_blocked_reason": "",
                 }
                 if runtime.get("runner_recovery_attempt_count"):
                     starting_patch.update(
@@ -9726,11 +10002,7 @@ class SyncManager:
                         raise StudioError(
                             "Native change-capture tasks require Redis to persist root-key queues."
                         )
-                    runner: t.Union[
-                        NativeProcessRunner,
-                        AssemblyRunner,
-                        CrossDatabaseHybridRunner,
-                    ] = CrossDatabaseHybridRunner(
+                    runner = CrossDatabaseHybridRunner(
                         self,
                         job,
                         resume_incremental_only=resume_incremental_only,
@@ -9748,7 +10020,9 @@ class SyncManager:
                 runner.start()
                 return self.store.get_job_runtime(job_id)
             except Exception:
-                self.release_job_lease(job_id, clear_owner=True)
+                if runner is not None:
+                    self.signal_runner_stop(runner)
+                self.on_runner_finished(job_id, runner)
                 raise
 
     def stop_job(self, job_id: str) -> dict:
@@ -9756,7 +10030,9 @@ class SyncManager:
             runner = self.runners.get(job_id)
             runtime: dict = self.store.get_job_runtime(job_id)
             owner: str = runtime.get("owner") or ""
-            holder: dict = self.describe_job_holder(job_id)
+            holder: dict = (
+                {} if runner is not None else self.describe_job_holder(job_id)
+            )
             holder_owner: str = holder.get("owner_instance_id") or ""
             if (
                 not runner

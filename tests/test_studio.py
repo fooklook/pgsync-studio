@@ -7,6 +7,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -2943,6 +2944,9 @@ def test_failed_resumable_job_uses_persisted_exponential_backoff(
     tmp_path: Path,
     monkeypatch,
 ):
+    monkeypatch.setattr(
+        sync_manager_module.random, "uniform", lambda *args: 1.0
+    )
     clock = {"now": 1000.0}
     monkeypatch.setattr(
         sync_manager_module,
@@ -3001,14 +3005,14 @@ def test_failed_resumable_job_uses_persisted_exponential_backoff(
 @pytest.mark.parametrize(
     "runtime_patch",
     [
-        {"phase": "lease_lost"},
+        {"runner_recovery_blocked_reason": "authentication_error"},
         {"desired_state": "stopped"},
         {"baseline_completed": False},
         {"resume_strategy": "assembly_incremental"},
         {"assembly_recovery_requires_full_sync": True},
     ],
     ids=[
-        "lease-lost",
+        "authentication-error",
         "desired-stopped",
         "baseline-incomplete",
         "strategy-mismatch",
@@ -3127,6 +3131,9 @@ def test_failed_recovery_start_error_advances_backoff(
     tmp_path: Path,
     monkeypatch,
 ):
+    monkeypatch.setattr(
+        sync_manager_module.random, "uniform", lambda *args: 1.0
+    )
     clock = {"now": 1000.0}
     monkeypatch.setattr(
         sync_manager_module,
@@ -3178,7 +3185,9 @@ def test_stable_auto_recovered_runner_resets_consecutive_failure_backoff(
             "runner_recovery_started_ts": 1000.0,
         },
     )
-    manager.runners["job_1"] = object()
+    manager.runners["job_1"] = SimpleNamespace(
+        thread=SimpleNamespace(is_alive=lambda: True)
+    )
 
     clock["now"] = 1059.0
     manager.reconcile_runtime_states()
