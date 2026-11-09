@@ -18,6 +18,7 @@ PostgreSQL → Elasticsearch 同步平台，提供 Web 配置台、跨库文档�
 - 支持单库、多表及跨数据库宽文档同步。
 - 支持触发器通知、持久化 outbox、Redis 队列、任务租约和补偿扫描。
 - 支持 PostgreSQL、配置库及 Redis 短暂故障后的增量任务自动恢复，包含退避重试和租约校验。
+- ES 认证或权限异常后持续定时退避续跑，恢复后由原增量逻辑自动消化历史积压，不需要独立补偿程序。
 - 支持从库读取：批次级 required LSN、回放检查、短暂等待及主库回退。
 - 支持按天创建 outbox 分区，并依据保留期和消费者安全水位维护历史分区。
 - 提供任务日志、调试信息、ES 查询、别名管理和 Prometheus 指标。
@@ -86,7 +87,7 @@ python -m pip install -r requirements/dev.txt
 python -m pip install --no-deps -e .
 $env:PG_USER = 'studio'
 $env:ELASTICSEARCH = 'true'
-python -m pytest -q tests/test_studio.py tests/test_studio_metrics.py tests/test_read_replica.py tests/test_nacos_read_replica.py tests/test_studio_recovery.py tests/test_studio_runtime_credentials.py
+python -m pytest -q tests/test_studio.py tests/test_studio_metrics.py tests/test_read_replica.py tests/test_nacos_read_replica.py tests/test_studio_recovery.py tests/test_studio_runtime_credentials.py tests/test_studio_search_recovery.py
 python tools/check_public_export.py
 ```
 

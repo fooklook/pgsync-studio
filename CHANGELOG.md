@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Retry Elasticsearch 401/403 access failures instead of permanently blocking
+  resumable tasks. Use persisted, jittered 60-to-300-second backoff without a
+  maximum retry count, including item-level bulk indexing and deletion errors.
+- Migrate recognizable legacy ES access blocks without bypassing manual stops,
+  baseline checks, incompatible resume strategies, or exclusive job leases.
+- Show ES access retry plans in the UI and add regression coverage for a
+  disconnect-to-401-to-403-to-recovery sequence, retained queues, and normal
+  incremental catch-up without rebuilding tasks or indices.
 - Keep the recovery supervisor alive through temporary PostgreSQL/configuration
   store failures; reap dead runners and retry eligible incremental jobs with
   capped exponential backoff and jitter.

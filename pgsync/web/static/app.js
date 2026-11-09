@@ -191,6 +191,9 @@ function buildResumeHint(runtime) {
         }
         if (runtime?.runner_recovery_next_attempt_ts) {
             const next = new Date(Number(runtime.runner_recovery_next_attempt_ts) * 1000).toLocaleString();
+            if (["search_authentication_error", "search_permission_error"].includes(runtime?.runner_recovery_wait_reason)) {
+                return `等待 ES 认证或权限恢复，将自动从原断点续跑；第 ${runtime.runner_recovery_attempt_count || 1} 次重试预计 ${next} 执行。原因：${runtime.runner_recovery_last_error || runtime.last_error || "ES 访问异常"}`;
+            }
             return `等待自动恢复，第 ${runtime.runner_recovery_attempt_count || 1} 次重试预计 ${next} 执行。原因：${runtime.runner_recovery_last_error || runtime.last_error || "依赖暂时不可用"}`;
         }
         if (runtime?.runner_alive === false && ["running", "starting"].includes(runtime?.status)) {

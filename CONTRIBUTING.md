@@ -10,7 +10,7 @@ On POSIX shells:
 
 ```sh
 export PG_USER=studio ELASTICSEARCH=true
-python -m pytest -q tests/test_studio.py tests/test_studio_metrics.py tests/test_read_replica.py tests/test_nacos_read_replica.py tests/test_studio_recovery.py tests/test_studio_runtime_credentials.py
+python -m pytest -q tests/test_studio.py tests/test_studio_metrics.py tests/test_read_replica.py tests/test_nacos_read_replica.py tests/test_studio_recovery.py tests/test_studio_runtime_credentials.py tests/test_studio_search_recovery.py
 ```
 
 In PowerShell:
@@ -18,7 +18,7 @@ In PowerShell:
 ```powershell
 $env:PG_USER = 'studio'
 $env:ELASTICSEARCH = 'true'
-python -m pytest -q tests/test_studio.py tests/test_studio_metrics.py tests/test_read_replica.py tests/test_nacos_read_replica.py tests/test_studio_recovery.py tests/test_studio_runtime_credentials.py
+python -m pytest -q tests/test_studio.py tests/test_studio_metrics.py tests/test_read_replica.py tests/test_nacos_read_replica.py tests/test_studio_recovery.py tests/test_studio_runtime_credentials.py tests/test_studio_search_recovery.py
 ```
 
 These unit tests use temporary stores, mocks, and synthetic data. The recovery

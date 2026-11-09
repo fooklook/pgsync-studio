@@ -1,7 +1,7 @@
 # Task auto-recovery
 
 Studio supervises its task runners and retries eligible incremental tasks after
-temporary PostgreSQL, configuration-store, or Redis failures. No extra retry
+temporary PostgreSQL, configuration-store, Redis, or Elasticsearch access failures. No extra retry
 switch is required. This covers recovery of an already initialized task; it is
 not an automatic full rebuild of an incomplete or damaged synchronization.
 
@@ -25,14 +25,50 @@ not an automatic full rebuild of an incomplete or damaged synchronization.
   A stale batch cannot acknowledge or requeue a newer owner's inflight batch.
   Uncertain writes retain their root keys for replay; repeated writes can occur
   under the existing document-ID based synchronization semantics.
-- Recognized authentication, PostgreSQL schema/permission, and search
-  configuration/permission errors block automatic retries. Fix the cause and
+- Elasticsearch 401/403 access failures do not permanently block resumable jobs.
+  They use the existing supervisor to retry incremental startup, with a
+  60-second initial delay, up to 10% jitter, and exponential backoff capped at
+  300 seconds. There is no maximum retry count. Previous consecutive failures
+  can put the first access retry into a longer delay tier. Item-level bulk
+  indexing and deletion errors use the same classification; a batch containing
+  a 400 request error still requires operator review.
+- Recognized Redis/PostgreSQL authentication, PostgreSQL schema/permission,
+  and Elasticsearch 400 request errors block automatic retries. Fix the cause and
   start the task manually; inspect `runner_recovery_blocked_reason` first.
 
 Restore dependency connectivity and credentials before expecting a task to
 resume. A long outage may leave up to 300 seconds of retry delay, plus supervisor
 polling, worker shutdown, lease handling, and backlog processing. Recovery of the
 runner and completion of catch-up are separate observations.
+
+## Elasticsearch access recovery
+
+No new scheduler, configuration switch, database DDL, or Kubernetes deployment
+change is required when upgrading an installation that already uses
+`/health/live`. This mechanism attempts normal incremental startup rather than
+using a successful TCP connection, ping, or read-only query as proof that writes
+are allowed. ES does not need to reach green cluster status before recovery.
+
+Each new runner constructs its ES client from the currently effective service
+configuration and credentials. This does not add secret rotation, credential
+hot-reload, or automatic password changes. Environment/Secret changes must still
+be made effective through the installation's existing configuration mechanism.
+
+The persisted `runner_recovery_wait_reason` distinguishes
+`search_authentication_error` and `search_permission_error` from a permanent
+configuration block. The UI shows the next retry time. A startup attempt is not
+evidence of completed catch-up: only confirmed ES batches establish write
+progress. The existing outbox consumer, root queue, and recovery scans process
+retained historical work and new events after recovery; no separate compensation
+program, business timestamp update, or index rebuild is needed for this path.
+
+On upgrade, known legacy `AuthenticationException(401, ...)`,
+`AuthorizationException(403, ...)`, and equivalent `TransportError` blocks are
+automatically converted to scheduled retries for otherwise eligible jobs.
+Ambiguous old configuration errors remain blocked; arbitrary 401/403 digits in
+an error message do not establish recoverability. Manual stops, incomplete
+baselines, incompatible resume strategies, full-sync requirements, and lease
+ownership checks continue to take precedence.
 
 ## Persistent state and limits
 
@@ -113,7 +149,16 @@ the final documents against the source. Include an outage longer than the
 configured lease TTL and a manual-stop case. Never stop shared dependencies to
 perform this check.
 
+For ES-specific acceptance, interrupt only a disposable instance's ES route,
+return 401, then allow reads while denying writes with 403, and finally restore
+access. Keep the real retry timings; do not manually restart the task, adjust its
+timer, or clear its queues. Verify that it resumes the original index and drains
+historical work plus outage-time inserts, updates, deletes, and cross-database
+child changes. Compare document content, not just counts. A manually stopped
+control task must remain stopped. Confirm that no container restart was involved.
+
 The unit suite includes temporary configuration-store failures, dead runners,
 lease loss, recovery-loop failures, manual stops, blocked authentication errors,
-stale batch acknowledgements, and runtime credential resolution. See
+stale batch acknowledgements, runtime credential resolution, and scheduled ES
+401/403 retries with automatic catch-up. See
 [Contributing](../CONTRIBUTING.md) for the commands.

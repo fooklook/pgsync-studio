@@ -62,6 +62,7 @@ NATIVE_SETUP_CHECKPOINT_MARKER = "__PGSYNC_CHECKPOINT__="
 DEFAULT_POLL_INTERVAL_SECONDS = 60
 DEFAULT_RECOVERY_POLL_INTERVAL_SECONDS = 10
 DEFAULT_FAILED_RECOVERY_INITIAL_DELAY_SECONDS = 10
+DEFAULT_SEARCH_ACCESS_RECOVERY_INITIAL_DELAY_SECONDS = 60
 DEFAULT_FAILED_RECOVERY_MAX_DELAY_SECONDS = 300
 DEFAULT_FAILED_RECOVERY_STABLE_SECONDS = 60
 DEFAULT_AUTO_DISCOVER_CONNECTIONS_TIME = "20:00"
@@ -123,6 +124,14 @@ AUTO_DISCOVER_CONNECTIONS_TIME_ENV = (
 
 class StudioError(RuntimeError):
     """Domain exception for the studio layer."""
+
+
+class SearchBulkError(StudioError):
+    """Keep bulk deletion statuses available to the recovery classifier."""
+
+    def __init__(self, errors: list[dict]) -> None:
+        super().__init__(f"Elasticsearch delete_many failed: {errors[:3]}")
+        self.errors = errors
 
 
 def get_in(payload: t.Any, *path: str) -> t.Any:
@@ -629,9 +638,7 @@ class SearchAdapter:
                 unexpected_errors.append(error)
             if unexpected_errors:
                 metric_status = "error"
-                raise StudioError(
-                    f"Elasticsearch delete_many failed: {unexpected_errors[:3]}"
-                )
+                raise SearchBulkError(unexpected_errors)
         except Exception:
             metric_status = "error"
             raise
@@ -7474,19 +7481,31 @@ class SyncManager:
             return False
         if runtime.get("phase") not in {"failed", "lease_lost"}:
             return False
-        if runtime.get("runner_recovery_blocked_reason"):
+        if runtime.get("runner_recovery_blocked_reason") and not (
+            self.runtime_recovery_wait_reason(runtime)
+        ):
             return False
         if runtime.get("assembly_recovery_requires_full_sync"):
             return False
         return self.runtime_should_resume_incremental(job_id, runtime)
 
-    def failed_recovery_backoff_seconds(self, attempt_count: int) -> float:
+    def failed_recovery_backoff_seconds(
+        self,
+        attempt_count: int,
+        *,
+        initial_delay_seconds: t.Optional[float] = None,
+    ) -> float:
         """Return capped exponential backoff for a failed runner."""
         normalized_attempt_count: int = max(1, int(attempt_count or 1))
         exponent: int = min(20, normalized_attempt_count - 1)
         return min(
             self.failed_recovery_max_delay_seconds,
-            self.failed_recovery_initial_delay_seconds * (2**exponent),
+            (
+                self.failed_recovery_initial_delay_seconds
+                if initial_delay_seconds is None
+                else initial_delay_seconds
+            )
+            * (2**exponent),
         )
 
     def schedule_failed_runtime_recovery(
@@ -7505,6 +7524,20 @@ class SyncManager:
             current_runtime,
         ):
             return current_runtime
+        wait_reason: str = self.runtime_recovery_wait_reason(current_runtime)
+        if wait_reason and current_runtime.get(
+            "runner_recovery_blocked_reason"
+        ):
+            # Migrate only recognizable ES 401/403 failures from old releases.
+            # Keep ambiguous 400/configuration errors blocked for review.
+            current_runtime = self.store.update_job_runtime(
+                job_id,
+                {
+                    "runner_recovery_blocked_reason": "",
+                    "runner_recovery_wait_reason": wait_reason,
+                    "runner_recovery_next_attempt_ts": None,
+                },
+            )
         raw_next_attempt_ts: t.Any = current_runtime.get(
             "runner_recovery_next_attempt_ts"
         )
@@ -7523,7 +7556,12 @@ class SyncManager:
             previous_attempt_count = 0
         attempt_count: int = previous_attempt_count + 1
         delay_seconds: float = self.failed_recovery_backoff_seconds(
-            attempt_count
+            attempt_count,
+            initial_delay_seconds=(
+                DEFAULT_SEARCH_ACCESS_RECOVERY_INITIAL_DELAY_SECONDS
+                if wait_reason
+                else None
+            ),
         )
         delay_seconds = min(
             self.failed_recovery_max_delay_seconds,
@@ -7538,6 +7576,7 @@ class SyncManager:
             "runner_recovery_last_error": str(
                 current_runtime.get("last_error") or ""
             ),
+            "runner_recovery_wait_reason": wait_reason,
             "runner_recovery_started_at": None,
             "runner_recovery_started_ts": None,
         }
@@ -7764,7 +7803,66 @@ class SyncManager:
         )
 
     @staticmethod
-    def recovery_blocked_reason(exc: Exception) -> str:
+    def search_error_statuses(exc: Exception) -> set[int]:
+        """Include item-level failures returned by an HTTP-successful bulk."""
+        raw_statuses: list[t.Any] = [getattr(exc, "status_code", None)]
+        if isinstance(exc, (helpers.BulkIndexError, SearchBulkError)):
+            for item in exc.errors:
+                if not isinstance(item, dict):
+                    continue
+                for operation in item.values():
+                    if isinstance(operation, dict):
+                        raw_statuses.append(operation.get("status"))
+        statuses: set[int] = set()
+        for status in raw_statuses:
+            try:
+                statuses.add(int(status))
+            except (TypeError, ValueError):
+                continue
+        return statuses
+
+    @classmethod
+    def recovery_wait_reason(cls, exc: Exception) -> str:
+        """ES access failures wait and retry; a 400 still requires review."""
+        statuses: set[int] = cls.search_error_statuses(exc)
+        if 400 in statuses:
+            return ""
+        if 401 in statuses:
+            return "search_authentication_error"
+        if 403 in statuses:
+            return "search_permission_error"
+        return ""
+
+    @staticmethod
+    def runtime_recovery_wait_reason(runtime: dict) -> str:
+        blocked: str = str(runtime.get("runner_recovery_blocked_reason") or "")
+        if blocked not in {"", "search_configuration_or_permission_error"}:
+            return ""
+        reason: str = str(runtime.get("runner_recovery_wait_reason") or "")
+        if not blocked and reason in {
+            "search_authentication_error",
+            "search_permission_error",
+        }:
+            return reason
+        if blocked == "search_configuration_or_permission_error":
+            # Older runtimes persisted only the exception string. Do not infer
+            # recoverability from arbitrary digits in a mapping/error message.
+            error: str = str(runtime.get("last_error") or "").strip()
+            for prefix, wait_reason in (
+                (
+                    "AuthenticationException(401,",
+                    "search_authentication_error",
+                ),
+                ("AuthorizationException(403,", "search_permission_error"),
+                ("TransportError(401,", "search_authentication_error"),
+                ("TransportError(403,", "search_permission_error"),
+            ):
+                if error.startswith(prefix):
+                    return wait_reason
+        return ""
+
+    @classmethod
+    def recovery_blocked_reason(cls, exc: Exception) -> str:
         original = getattr(exc, "orig", exc)
         sqlstate = str(
             getattr(original, "pgcode", None)
@@ -7777,7 +7875,7 @@ class SyncManager:
             return "authentication_error"
         if sqlstate.startswith("42"):
             return "database_schema_or_permission_error"
-        if getattr(exc, "status_code", None) in {400, 401, 403}:
+        if 400 in cls.search_error_statuses(exc):
             return "search_configuration_or_permission_error"
         return ""
 
@@ -7812,6 +7910,9 @@ class SyncManager:
                         "runner_recovery_blocked_reason": self.recovery_blocked_reason(
                             exc
                         ),
+                        "runner_recovery_wait_reason": self.recovery_wait_reason(
+                            exc
+                        ),
                     },
                 )
         except Exception:
@@ -7834,6 +7935,9 @@ class SyncManager:
                     "health_status": HEALTH_STATUS_RECOVERING,
                     "runner_recovery_next_attempt_ts": None,
                     "runner_recovery_blocked_reason": self.recovery_blocked_reason(
+                        exc
+                    ),
+                    "runner_recovery_wait_reason": self.recovery_wait_reason(
                         exc
                     ),
                 },
@@ -9776,6 +9880,7 @@ class SyncManager:
             "runner_recovery_retry_delay_seconds": 0,
             "runner_recovery_last_failure_at": None,
             "runner_recovery_last_error": "",
+            "runner_recovery_wait_reason": "",
             "runner_recovery_started_at": None,
             "runner_recovery_started_ts": None,
             "runner_recovery_succeeded_at": None,
@@ -9984,6 +10089,7 @@ class SyncManager:
                     "heartbeat_at": utcnow(),
                     "resume_strategy": resume_strategy,
                     "runner_recovery_blocked_reason": "",
+                    "runner_recovery_wait_reason": "",
                 }
                 if runtime.get("runner_recovery_attempt_count"):
                     starting_patch.update(
